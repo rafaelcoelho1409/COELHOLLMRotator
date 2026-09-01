@@ -1,0 +1,10 @@
+{{- $appName := "fastapi" -}}
+{{- $appConfig := index $.Values $appName }}
+
+apiVersion: apps/v1
+{{- include "coelho-llm-rotator.DeploymentSettings" (dict "appName" $appName "root" .) | nindent 0 }}
+spec:
+  replicas: {{ $appConfig.replicas }}
+{{- include "coelho-llm-rotator.DeploymentSpecSettings" (dict "appName" $appName "root" .) | nindent 2 }}
+{{- include "coelho-llm-rotator.DeploymentResources" (dict "appName" $appName "root" .) | nindent 10}}
+{{- include "coelho-llm-rotator.ProbeSettings" (dict "appName" $appName "root" .) | nindent 10 }}

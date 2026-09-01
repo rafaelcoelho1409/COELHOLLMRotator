@@ -1,0 +1,6 @@
+{{- $appName := "fastapi" -}}
+
+apiVersion: v1
+{{- include "coelho-llm-rotator.ConfigMapSettings" (dict "appName" $appName "root" .) | nindent 0}}
+data:
+  {{- include "coelho-llm-rotator.commonEnvVars" . | nindent 2 }}

@@ -1,0 +1,72 @@
+environment: production
+
+redis:
+  host: redis-master.redis.svc.cluster.local
+  port: 6379
+
+secretName: coelho-llm-rotator-secret
+
+secretMappings:
+  - envName: REDIS_PASSWORD
+    key: redis-password
+  - envName: GROQ_API_KEY
+    key: groq-api-key
+  - envName: NVIDIA_API_KEY
+    key: nvidia-api-key
+  - envName: CEREBRAS_API_KEY
+    key: cerebras-api-key
+  - envName: MISTRAL_API_KEY
+    key: mistral-api-key
+  - envName: GOOGLE_API_KEY
+    key: google-api-key
+  - envName: DEEPSEEK_API_KEY
+    key: deepseek-api-key
+  - envName: SAMBANOVA_API_KEY
+    key: sambanova-api-key
+
+registry:
+  url: localhost:5001
+  imagePullSecret: ""
+
+fastapi:
+  image: localhost:5001/coelho-llm-rotator-fastapi:latest
+  imagePullPolicy: Always
+  replicas: 1
+  resources:
+    requests:
+      memory: "512Mi"
+      cpu: "200m"
+    limits:
+      memory: "2Gi"
+      cpu: "1000m"
+  portsSettings:
+    ports:
+      - name: http
+        port: 8000
+        targetPort: 8000
+        nodePort: 30020
+        protocol: TCP
+    type: LoadBalancer
+  startupProbeSettings:
+    startupProbe:
+      httpGet:
+        path: /health
+        port: 8000
+      failureThreshold: 30
+      periodSeconds: 10
+  livenessProbeSettings:
+    livenessProbe:
+      httpGet:
+        path: /health
+        port: 8000
+      initialDelaySeconds: 0
+      periodSeconds: 15
+      failureThreshold: 3
+  readinessProbeSettings:
+    readinessProbe:
+      httpGet:
+        path: /health
+        port: 8000
+      initialDelaySeconds: 0
+      periodSeconds: 5
+      failureThreshold: 3
