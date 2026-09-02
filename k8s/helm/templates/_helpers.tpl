@@ -103,6 +103,8 @@ template:
       - name: coelho-llm-rotator-{{ .appName }}
         image: {{ include "coelho-llm-rotator.imageName" (dict "appName" .appName "root" .root) }}
         imagePullPolicy: {{ index .root.Values .appName "imagePullPolicy" }}
+        {{- include "coelho-llm-rotator.DeploymentResources" (dict "appName" .appName "root" .root) | nindent 8 }}
+        {{- include "coelho-llm-rotator.ProbeSettings" (dict "appName" .appName "root" .root) | nindent 8 }}
         #securityContext:
         #  allowPrivilegeEscalation: false
         #  capabilities:
