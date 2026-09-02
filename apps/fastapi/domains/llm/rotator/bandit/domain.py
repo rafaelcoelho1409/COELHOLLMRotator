@@ -135,8 +135,12 @@ def make_context_vector(
     vault_size: int = 0,
     time_now: float | None = None,
     recent_error_rates: dict[str, float] | None = None,
+    input_tokens: int | None = None,
+    inflight_norm: float | None = None,
+    p50_latency_norm: float | None = None,
+    prefix_hash: str | None = None,
 ) -> np.ndarray:
-    """24-dim feature vector; sin/cos hour encoding makes 23:00 and 00:00 adjacent."""
+    """32-dim latency-aware: sin/cos hour + input/inflight/p50/prefix for HW-Router style prediction."""
     v = np.zeros(CONTEXT_DIM, dtype = np.float64)
     v[0] = 1.0
     v[1] = float(np.log1p(max(0, chapter_number)) / np.log(20.0))
@@ -162,6 +166,20 @@ def make_context_vector(
             slot = _PROVIDER_IDX.get(provider)
             if slot is not None:
                 v[19 + slot] = float(max(0.0, min(1.0, rate)))
+    # Latency-aware extensions (24-27)
+    if input_tokens is not None:
+        v[24] = float(min(1.0, max(0.0, float(np.log1p(max(0, input_tokens)) / np.log(4096.0)))))
+    if inflight_norm is not None:
+        v[25] = float(max(0.0, min(1.0, inflight_norm)))
+    if p50_latency_norm is not None:
+        v[26] = float(max(0.0, min(2.0, p50_latency_norm)) / 2.0)
+    if prefix_hash:
+        try:
+            import hashlib
+            h = int(hashlib.md5(prefix_hash.encode()).hexdigest()[:8], 16)
+            v[27] = float((h % 100) / 100.0)
+        except Exception:
+            pass
     return v
 
 

@@ -214,6 +214,53 @@ def _get_provider_inflight() -> dict[str, int]:
     return state
 
 
+# EWMA per-provider latency for latency-aware context (HW-Router style)
+_provider_latency_ewma: dict[str, float] = {}
+_provider_latency_alpha = 0.2
+
+def _update_provider_latency(provider: str, latency_s: float) -> None:
+    prev = _provider_latency_ewma.get(provider)
+    if prev is None:
+        _provider_latency_ewma[provider] = latency_s
+    else:
+        _provider_latency_ewma[provider] = (1 - _provider_latency_alpha) * prev + _provider_latency_alpha * latency_s
+
+def _get_provider_p50(provider: str, default: float = 1.0) -> float:
+    return _provider_latency_ewma.get(provider, default)
+
+# Prefix-affinity for KV-cache reuse (Ranvier / llm-d EPP style)
+# Redis key: rotator:prefix:{hash} -> provider, TTL 300s
+_PREFIX_TTL_S = 300
+
+def _prefix_hash(prompt: str) -> str:
+    try:
+        import hashlib
+        # first 512 chars of prompt (system + prefix) - char approx 4:1 token
+        h = hashlib.md5(prompt[:512].encode()).hexdigest()[:8]
+        return h
+    except Exception:
+        return ""
+
+async def _get_prefix_affinity(prefix_hash: str, redis) -> str | None:
+    if not prefix_hash or redis is None:
+        return None
+    try:
+        v = await redis.get(f"rotator:prefix:{prefix_hash}")
+        if isinstance(v, bytes):
+            v = v.decode()
+        return v if v else None
+    except Exception:
+        return None
+
+async def _set_prefix_affinity(prefix_hash: str, provider: str, redis) -> None:
+    if not prefix_hash or not provider or redis is None:
+        return
+    try:
+        await redis.set(f"rotator:prefix:{prefix_hash}", provider, ex=_PREFIX_TTL_S)
+    except Exception:
+        pass
+
+
 def _groq_entry(group: str, model: str, timeout_s: int = 120) -> dict:
     return {
         "model_name": group,
@@ -501,7 +548,22 @@ async def chat_judge_bandit_async(
         if filtered:
             candidates = filtered
         # Empty-filter → keep full set rather than 503.
-    ctx = bandit.make_context_vector(effective_task)
+    # latency-aware context: input len, inflight, p50, prefix
+    try:
+        input_tokens = max(1, len(prompt) // 4)
+        prefix = _prefix_hash(prompt)
+        inflight_map = _get_provider_inflight()
+        total_cap = sum(_PROVIDER_CAPS.values())
+        total_inflight = sum(inflight_map.get(p, 0) for p in _PROVIDER_CAPS)
+        inflight_norm = total_inflight / max(1, total_cap)
+        avg_p50 = sum(_get_provider_p50(p) for p in _PROVIDER_CAPS) / max(1, len(_PROVIDER_CAPS))
+        p50_norm = avg_p50 / max(0.1, JUDGE.expected_latency_s)
+    except Exception:
+        input_tokens = None
+        prefix = ""
+        inflight_norm = None
+        p50_norm = None
+    ctx = bandit.make_context_vector(effective_task, input_tokens=input_tokens, inflight_norm=inflight_norm, p50_latency_norm=p50_norm, prefix_hash=prefix)
     pattern = re.compile(expected_pattern) if expected_pattern else None
     try:
         ranked = await bandit.predict_top_k(
@@ -522,6 +584,23 @@ async def chat_judge_bandit_async(
                         f"{len(ranked) - len(filtered)} arm(s) for {effective_task}"
                     )
                 ranked = filtered
+        # prefix affinity boost (Ranvier / llm-d EPP style) - KV-cache reuse
+        try:
+            aff = await _get_prefix_affinity(prefix, rds)
+            if aff:
+                boosted = []
+                for dep, sc, nobs in ranked:
+                    prov = dep.split("/")[0] if "/" in dep else ""
+                    if prov == aff:
+                        boosted.append((dep, sc + 0.15, nobs))
+                    else:
+                        boosted.append((dep, sc, nobs))
+                boosted.sort(key=lambda x: (-x[1], x[2], x[0]))
+                if boosted != ranked:
+                    logger.debug(f"[judge-bandit] prefix affinity boost for {aff}")
+                    ranked = boosted
+        except Exception:
+            pass
     except Exception as e:
         logger.warning(f"[judge-bandit] predict_top_k failed: {e}; falling back to router-shuffle")
         try:
@@ -617,6 +696,13 @@ async def chat_judge_bandit_async(
                         ctx,
                         reward,
                         redis = rds)
+                except Exception:
+                    pass
+                # HW-Router style EWMA + prefix affinity
+                try:
+                    _update_provider_latency(provider, latency_s)
+                    if success:
+                        await _set_prefix_affinity(prefix, provider, rds)
                 except Exception:
                     pass
                 if success and schema_valid:
@@ -1251,7 +1337,32 @@ class _BanditRoutedRotatorChain(_RotatorAutoRetryRouter):
                     messages, stop=stop, run_manager=run_manager, **kwargs,
                 )
             candidates = [e["litellm_params"]["model"] for e in entries]
-            ctx = bandit.make_context_vector(self._BANDIT_TASK)
+            # latency-aware context: input len, inflight, p50, prefix
+            try:
+                # estimate input tokens from messages
+                prompt_text = ""
+                try:
+                    for m in messages:
+                        c = getattr(m, "content", "") or ""
+                        if isinstance(c, list):
+                            c = " ".join(str(x.get("text","")) if isinstance(x, dict) else str(x) for x in c)
+                        prompt_text += str(c) + " "
+                except Exception:
+                    prompt_text = ""
+                input_tokens = max(1, len(prompt_text) // 4)
+                prefix = _prefix_hash(prompt_text)
+                inflight_map = _get_provider_inflight()
+                total_cap = sum(_PROVIDER_CAPS.values())
+                total_inflight = sum(inflight_map.get(p, 0) for p in _PROVIDER_CAPS)
+                inflight_norm = total_inflight / max(1, total_cap)
+                avg_p50 = sum(_get_provider_p50(p) for p in _PROVIDER_CAPS) / max(1, len(_PROVIDER_CAPS))
+                p50_norm = avg_p50 / max(0.1, self._GENERAL_EXPECTED_LATENCY_S)
+            except Exception:
+                input_tokens = None
+                prefix = ""
+                inflight_norm = None
+                p50_norm = None
+            ctx = bandit.make_context_vector(self._BANDIT_TASK, input_tokens=input_tokens, inflight_norm=inflight_norm, p50_latency_norm=p50_norm, prefix_hash=prefix)
             try:
                 ranked = await bandit.predict_top_k(
                     self._BANDIT_TASK,
@@ -1288,6 +1399,22 @@ class _BanditRoutedRotatorChain(_RotatorAutoRetryRouter):
                 return await super()._agenerate(
                     messages, stop=stop, run_manager=run_manager, **kwargs,
                 )
+
+            # prefix affinity boost (Ranvier style)
+            try:
+                aff = await _get_prefix_affinity(prefix, rds)
+                if aff:
+                    boosted = []
+                    for dep, sc, nobs in ranked:
+                        prov = dep.split("/")[0] if "/" in dep else ""
+                        if prov == aff:
+                            boosted.append((dep, sc + 0.15, nobs))
+                        else:
+                            boosted.append((dep, sc, nobs))
+                    boosted.sort(key=lambda x: (-x[1], x[2], x[0]))
+                    ranked = boosted
+            except Exception:
+                pass
 
             try:
                 oai_messages = convert_to_openai_messages(messages)
@@ -1416,6 +1543,10 @@ class _BanditRoutedRotatorChain(_RotatorAutoRetryRouter):
                                             )
                                         except Exception:
                                             pass
+                                        try:
+                                            _update_provider_latency(provider, latency_s)
+                                        except Exception:
+                                            pass
                                         logger.warning(
                                             f"[bandit] {deployment_id} empty generations; "
                                             f"cascading"
@@ -1442,6 +1573,11 @@ class _BanditRoutedRotatorChain(_RotatorAutoRetryRouter):
                                             deployment_id, self._BANDIT_TASK,
                                             ctx, reward, redis = rds,
                                         )
+                                    except Exception:
+                                        pass
+                                    try:
+                                        _update_provider_latency(provider, latency_s)
+                                        await _set_prefix_affinity(prefix, provider, rds)
                                     except Exception:
                                         pass
                                     logger.debug(
@@ -1478,6 +1614,10 @@ class _BanditRoutedRotatorChain(_RotatorAutoRetryRouter):
                                             deployment_id, self._BANDIT_TASK,
                                             ctx, reward, redis = rds,
                                         )
+                                    except Exception:
+                                        pass
+                                    try:
+                                        _update_provider_latency(provider, latency_s)
                                     except Exception:
                                         pass
                                     logger.info(
