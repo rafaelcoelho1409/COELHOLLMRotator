@@ -14,12 +14,7 @@ if TYPE_CHECKING:
 
 from .domain import Mode, score_cell
 from .entities import CellState
-from .keys import (
-    CACHE_PREFIX,
-    cell_key,
-    provider_slot_key,
-    reservation_key,
-)
+from .keys import cell_key
 from .params import (
     CELL_TTL_S, 
     UCB_ALPHA
@@ -45,26 +40,6 @@ def _resolve_mode(override: Mode | None = None) -> Mode:
 
 # numpy.Generator draws are safe to call concurrently from asyncio coroutines.
 _RNG = np.random.default_rng()
-
-# SOTA Aug 2026: lognormal TTFT per model (Ramp Thompson over lognormal latency posteriors)
-import math as _math
-_latency_lognormal: dict[str, list[float]] = {}
-def _update_latency_lognormal(model: str, latency_s: float) -> None:
-    lst = _latency_lognormal.setdefault(model, [])
-    lst.append(_math.log(max(latency_s, 0.01)))
-    if len(lst) > 100: lst.pop(0)
-
-def _latency_score_lognormal(model: str) -> float:
-    lst = _latency_lognormal.get(model)
-    if not lst or len(lst) < 3:
-        return 0.5
-    mu = sum(lst)/len(lst)
-    return _math.exp(-mu)  # higher when TTFT low
-
-# KV-cache affinity 57x warm vs cold (Workload–Router–Pool 2603.21354): track prefix hits
-_kv_cache_hits: dict[str, int] = {}
-
-
 
 try:
     logger.info(f"[pareto] bandit scoring mode at startup: {_resolve_mode()}")
@@ -111,107 +86,7 @@ async def save_cell_state(
         return False
 
 
-async def get_all_cells(
-    *,
-    redis: "redis_aio.Redis | None",
-    pattern: str | None = None,
-) -> list[CellState]:
-    if redis is None:
-        return []
-    out: list[CellState] = []
-    scan_pattern = f"{CACHE_PREFIX}*{pattern}" if pattern else f"{CACHE_PREFIX}*"
-    try:
-        async for key in redis.scan_iter(match=scan_pattern):
-            try:
-                raw = await redis.get(key)
-                if raw is None:
-                    continue
-                if isinstance(raw, bytes):
-                    raw = raw.decode()
-                out.append(CellState.from_dict(json.loads(raw)))
-            except Exception:
-                continue
-    except Exception as e:
-        logger.warning(f"[pareto] cell scan failed: {type(e).__name__}: {e}")
-    return out
 
-
-async def init_bandit_warm_start(
-    deployments_by_step: dict[str, list[tuple[str, float]]],
-    *,
-    redis: "redis_aio.Redis | None",
-    overwrite: bool = False,
-) -> int:
-    if redis is None or not deployments_by_step:
-        return 0
-    count = 0
-    for task, deployments in deployments_by_step.items():
-        for deployment_id, score in deployments:
-            if not overwrite:
-                existing = await get_cell_state(
-                    deployment_id, 
-                    task, 
-                    redis = redis)
-                if existing is not None:
-                    continue
-            cell = CellState.fresh(deployment_id, task, score)
-            if await save_cell_state(
-                cell, 
-                redis = redis):
-                count += 1
-    logger.info(
-        f"[pareto] warm-start: initialized {count} cells across "
-        f"{len(deployments_by_step)} tasks"
-    )
-    return count
-
-
-async def predict(
-    task: str,
-    context: np.ndarray,
-    candidate_deployments: list[str],
-    *,
-    redis: "redis_aio.Redis | None",
-    alpha: float = UCB_ALPHA,
-    mode: Mode | None = None,
-) -> tuple[str | None, dict[str, Any]]:
-    if not candidate_deployments:
-        return None, {"reason": "no_candidates"}
-    resolved_mode = _resolve_mode(mode)
-    cells = await asyncio.gather(
-        *[get_cell_state(d, task, redis = redis) for d in candidate_deployments]
-    )
-    scored: list[tuple[str, float, float, float, int]] = []
-    for deployment, cell in zip(candidate_deployments, cells):
-        if cell is None:
-            cell = CellState.fresh(deployment, task, benchmark_prior = 0.0)
-        total, exploit, explore = score_cell(
-            cell, 
-            context, 
-            resolved_mode, 
-            rng = _RNG, 
-            alpha = alpha)
-        scored.append((deployment, total, exploit, explore, cell.n_obs))
-    # Tie-break by lowest n_obs to favor under-sampled arms.
-    scored.sort(key = lambda x: (-x[1], x[4], x[0]))
-    winner = scored[0]
-    _record_predict(task, resolved_mode)
-    _record_score(winner[1], resolved_mode)
-    debug = {
-        "winner":               winner[0],
-        "winner_score":         winner[1],
-        "winner_exploit":       winner[2],
-        "winner_explore_bonus": winner[3],
-        "winner_n_obs":         winner[4],
-        "mode":                 resolved_mode,
-        # Back-compat with dashboards keyed on `winner_ucb`.
-        "winner_ucb":           winner[1],
-        "all_scores": [
-            {"deployment": d, "score": t, "exploit": e, "explore": x, "n_obs": n}
-            for d, t, e, x, n in scored
-        ],
-    }
-    return winner[0], debug
 
 
 async def update(
@@ -271,77 +146,7 @@ async def predict_top_k(
     return scored[: max(1, k)]
 
 
-async def try_reserve(
-    deployment: str,
-    task: str,
-    *,
-    redis: "redis_aio.Redis | None",
-    ttl_s: int = 60,
-) -> bool:
-    """Atomic claim; False ⇒ another caller holds it. Fail-soft on Redis errors → True."""
-    if redis is None:
-        return True
-    try:
-        claimed = await redis.set(
-            reservation_key(deployment, task), 
-            "1", 
-            ex = ttl_s, 
-            nx = True)
-        return bool(claimed)
-    except Exception:
-        return True
 
-
-async def release_reservation(
-    deployment: str,
-    task: str,
-    *,
-    redis: "redis_aio.Redis | None",
-) -> None:
-    if redis is None:
-        return
-    try:
-        await redis.delete(reservation_key(deployment, task))
-    except Exception:
-        pass
-
-
-async def try_reserve_provider_slot(
-    provider: str,
-    *,
-    redis: "redis_aio.Redis | None",
-    max_slots: int,
-    ttl_s: int = 1800,
-) -> int | None:
-    """Claim one of `max_slots` slots; returns idx or None when all taken. Fail-soft → 0."""
-    if redis is None:
-        return 0
-    for slot_idx in range(max_slots):
-        try:
-            claimed = await redis.set(
-                provider_slot_key(provider, slot_idx), 
-                "1", 
-                ex = ttl_s, 
-                nx = True)
-            if claimed:
-                return slot_idx
-        except Exception:
-            continue
-    return None
-
-
-async def release_provider_slot(
-    provider: str,
-    slot_idx: int | None,
-    *,
-    redis: "redis_aio.Redis | None",
-) -> None:
-    if redis is None or slot_idx is None:
-        return
-    try:
-        await redis.delete(provider_slot_key(provider, slot_idx))
-    except Exception:
-        pass
 
 
 _metric_instruments: dict[str, Any] = {}
@@ -355,9 +160,8 @@ def _record_predict(*args, **kwargs):
     return
 
 
-def _track_latency_for_bandit(model: str, latency_s: float) -> None:
-    try: _update_latency_lognormal(model, latency_s)
-    except: pass
+def _track_latency_for_bandit(*args, **kwargs) -> None:
+    return
 
 def _record_update(*args, **kwargs):
     return

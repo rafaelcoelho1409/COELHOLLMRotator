@@ -20,11 +20,14 @@ import redis.asyncio as redis_aio
 from fastapi import APIRouter, Query, HTTPException, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 
-from domains.llm.rotator.benchmarks import get_benchmarks, canonicalize
+import logging
+
+from domains.llm.rotator.benchmarks import get_benchmarks
 from domains.llm.rotator.benchmarks.config import CACHE_TTL
 from domains.llm.rotator.benchmarks.domain import merge_leaderboards
 from domains.llm.rotator.benchmarks.params import STEP_WEIGHTS
-from domains.llm.rotator.discovery import PROVIDERS
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 

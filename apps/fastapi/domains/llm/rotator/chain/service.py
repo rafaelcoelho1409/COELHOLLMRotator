@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import re
@@ -697,9 +696,7 @@ def _all_entries() -> list:
         _gemini_entry(GROUP, "gemini-3-flash-preview",                     timeout_s = 120),
         _nim_entry(GROUP, "qwen/qwen3.5-397b-a17b",                        timeout_s = 120),
         _nim_entry(GROUP, "deepseek-ai/deepseek-v4-flash",                 timeout_s = 120),
-        _nim_entry(GROUP, "minimaxai/minimax-m2.7",                        timeout_s = 120),
         _nim_entry(GROUP, "nvidia/nemotron-3-super-120b-a12b",             timeout_s = 120),
-        _nim_entry(GROUP, "deepseek-ai/deepseek-v4-flash",                 timeout_s = 120),
         _gemini_entry(GROUP, "gemini-3.1-flash-lite",                      timeout_s = 90),
         _nim_entry(GROUP, "openai/gpt-oss-120b",                           timeout_s = 120),
         _gemini_entry(GROUP, "gemini-2.5-flash",                           timeout_s = 60),
@@ -805,19 +802,12 @@ def _apply_status_filter(entries: list[dict]) -> list[dict]:
     return out
 
 
-def _filter_by_tools(entries: list[dict], needs_tools: bool) -> list[dict]:
-    if not needs_tools: return entries
-    out = [e for e in entries if "compound" not in e.get("litellm_params",{}).get("model","")]
-    return out if out else entries
-
 def _sort_by_benchmark(entries: list[dict]) -> list[dict]:
     """SOTA: sort Router pool best→worst by benchmark general composite (TrueSkill μ−3σ).
     Uses in-mem cached boards via get_composite_cached (no network), fallback to original order."""
     try:
         from domains.llm.rotator.benchmarks.service import get_composite_cached
         from domains.llm.rotator.benchmarks.domain import normalize_model_name
-        from .params import _PROVIDER_CHAPTER_CAPS  # keep tie-break deterministic
-        # provider tier from benchmarks params
         from domains.llm.rotator.benchmarks.params import PROVIDER_TIER
     except Exception:
         return entries
@@ -1240,7 +1230,7 @@ class _BanditRoutedRotatorChain(_RotatorAutoRetryRouter):
         messages = _flatten_thinking_content(messages)
         _prune_arm_cooldown()
 
-        async with _get_rr_llm_sem():
+        async with _get_llm_sem():
             return await self._agenerate_inner(
                 messages, stop=stop, run_manager=run_manager, **kwargs,
             )
@@ -1322,7 +1312,7 @@ class _BanditRoutedRotatorChain(_RotatorAutoRetryRouter):
 
             last_err: Exception | None = None
             attempts = 0
-            inflight = _get_rr_provider_inflight()
+            inflight = _get_provider_inflight()
             async with genai_bandit_cascade_span(
                 task = self._BANDIT_TASK,
             ) as cascade:
@@ -1668,42 +1658,7 @@ def build_llm_fallback_chain(groq_timeout_s: int = 120, nim_timeout_s: int = 300
     )
 
 
-def build_general_chain():
-    """Rollback target for KD_GENERAL_BANDIT_CHAT=false."""
-    return _RotatorAutoRetryRouter(
-        router = _get_router(), model = GENERAL_GROUP, temperature = 0.0,
-    )
 
-
-def build_general_chain_bandit():
-    """FGTS-VA per turn; falls back to simple-shuffle when Redis unavailable or all arms exhausted."""
-    return _BanditRoutedRotatorChain(
-        router = _get_router(), model = GENERAL_GROUP, temperature = 0.0,
-    )
-
-
-def build_resolver_llm_chain(groq_timeout_s: int = 30, nim_timeout_s: int = 60):
-    return ChatLiteLLMRouter(
-        router = _get_router(),
-        model = GROUP,
-        temperature = 0.0)
-
-
-
-
-
-def get_parent_group(pinned_or_parent: str | None) -> str | None:
-    """Parent pool name for a pinned-group hash, or None."""
-    if not pinned_or_parent:
-        return None
-    return _pinned_to_parent.get(pinned_or_parent)
-
-
-def get_entries_for_group(group: str) -> list:
-    """Current entries for a parent pool — bandit cascade uses this when the
-    caller's llm is a pinned (1-entry) chain."""
-    if group == GROUP:
-        return general_entries_current()
     return general_entries_current()
 
 
@@ -1802,7 +1757,6 @@ def _record_to_entry(group: str, record, timeout_s: int) -> dict | None:
 
 # Single source of truth — Router model_list AND FGTS-VA bandit candidate
 # pools (the bandit bypasses Router via litellm.acompletion).
-USE_LEGACY_GROUPS = os.getenv("USE_LEGACY_GROUPS", "0") == "1"
 
 def general_entries_current() -> list:
     """Universal general pool — benchmark-sorted best→worst, single source of truth."""
@@ -1991,18 +1945,6 @@ async def ensure_dynamic_catalog() -> None:
     # don't hammer discovery while keyless.
     if _read_settings_gen() != _dynamic_built_gen:
         await init_dynamic_catalog(force = True)
-
-
-def init_dynamic_catalog_sync() -> bool:
-    """Sync wrapper (Celery worker_process_init). Do NOT call inside an
-    existing loop — spins up its own."""
-    try:
-        return asyncio.run(init_dynamic_catalog())
-    except Exception as e:
-        logger.warning(
-            f"[llm-chain] init_dynamic_catalog_sync failed: {type(e).__name__}: {e}"
-        )
-        return False
 
 
 # Periodic discovery refresh for EOL resilience. Combined with the EOL-broadened
