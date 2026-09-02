@@ -1789,11 +1789,14 @@ def _record_to_entry(group: str, record, timeout_s: int) -> dict | None:
     p, m = record.provider, record.model_id
     if not m:
         return None
-    if p == "groq":     return _groq_entry(group, m,     timeout_s = timeout_s)
-    if p == "nim":      return _nim_entry(group, m,      timeout_s = timeout_s)
-    if p == "cerebras": return _cerebras_entry(group, m, timeout_s = timeout_s)
-    if p == "mistral":  return _mistral_entry(group, m,  timeout_s = timeout_s)
-    if p == "gemini":   return _gemini_entry(group, m,   timeout_s = timeout_s)
+    if p == "groq":       return _groq_entry(group, m,       timeout_s = timeout_s)
+    if p == "nim":        return _nim_entry(group, m,        timeout_s = timeout_s)
+    if p == "cerebras":   return _cerebras_entry(group, m,   timeout_s = timeout_s)
+    if p == "mistral":    return _mistral_entry(group, m,    timeout_s = timeout_s)
+    if p == "gemini":     return _gemini_entry(group, m,     timeout_s = timeout_s)
+    if p == "openrouter": return _openrouter_entry(group, m, timeout_s = timeout_s)
+    if p == "deepseek":   return _deepseek_entry(group, m,   timeout_s = timeout_s)
+    if p == "sambanova":  return _sambanova_entry(group, m,  timeout_s = timeout_s)
     return None
 
 
