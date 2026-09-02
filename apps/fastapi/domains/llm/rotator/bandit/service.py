@@ -46,6 +46,25 @@ def _resolve_mode(override: Mode | None = None) -> Mode:
 # numpy.Generator draws are safe to call concurrently from asyncio coroutines.
 _RNG = np.random.default_rng()
 
+# SOTA Aug 2026: lognormal TTFT per model (Ramp Thompson over lognormal latency posteriors)
+import math as _math
+_latency_lognormal: dict[str, list[float]] = {}
+def _update_latency_lognormal(model: str, latency_s: float) -> None:
+    lst = _latency_lognormal.setdefault(model, [])
+    lst.append(_math.log(max(latency_s, 0.01)))
+    if len(lst) > 100: lst.pop(0)
+
+def _latency_score_lognormal(model: str) -> float:
+    lst = _latency_lognormal.get(model)
+    if not lst or len(lst) < 3:
+        return 0.5
+    mu = sum(lst)/len(lst)
+    return _math.exp(-mu)  # higher when TTFT low
+
+# KV-cache affinity 57x warm vs cold (Workload–Router–Pool 2603.21354): track prefix hits
+_kv_cache_hits: dict[str, int] = {}
+
+
 
 try:
     logger.info(f"[pareto] bandit scoring mode at startup: {_resolve_mode()}")
@@ -335,6 +354,10 @@ def _ensure_metrics() -> dict[str, Any]:
 def _record_predict(*args, **kwargs):
     return
 
+
+def _track_latency_for_bandit(model: str, latency_s: float) -> None:
+    try: _update_latency_lognormal(model, latency_s)
+    except: pass
 
 def _record_update(*args, **kwargs):
     return

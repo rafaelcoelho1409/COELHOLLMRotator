@@ -857,6 +857,11 @@ def _apply_status_filter(entries: list[dict]) -> list[dict]:
     return out
 
 
+def _filter_by_tools(entries: list[dict], needs_tools: bool) -> list[dict]:
+    if not needs_tools: return entries
+    out = [e for e in entries if "compound" not in e.get("litellm_params",{}).get("model","")]
+    return out if out else entries
+
 def _sort_by_benchmark(entries: list[dict]) -> list[dict]:
     """SOTA: sort Router pool best→worst by benchmark general composite (TrueSkill μ−3σ).
     Uses in-mem cached boards via get_composite_cached (no network), fallback to original order."""
