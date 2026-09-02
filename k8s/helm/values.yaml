@@ -23,6 +23,8 @@ secretMappings:
     key: deepseek-api-key
   - envName: SAMBANOVA_API_KEY
     key: sambanova-api-key
+  - envName: OPENROUTER_API_KEY
+    key: openrouter-api-key
   - envName: HF_TOKEN
     key: hf-token
 

@@ -18,10 +18,9 @@ DD_PROCESSES: tuple[str, ...] = (
     "dd-critic",
 )
 # Non-DD tasks skip the v[7+idx] one-hot; adding to DD_PROCESSES would need a CONTEXT_DIM bump, invalidating Redis CellStates.
-NON_DD_TASKS: tuple[str, ...] = (
-    "ycs-neo4j",
-)
+NON_DD_TASKS: tuple[str, ...] = ()
 _DD_PROCESS_IDX = {p: i for i, p in enumerate(DD_PROCESSES)}
+_DD_PROCESS_IDX["general"] = _DD_PROCESS_IDX["dd-all"]  # facade alias, no CONTEXT_DIM bump
 
 CONTEXT_PROVIDERS: tuple[str, ...] = (
     "groq",

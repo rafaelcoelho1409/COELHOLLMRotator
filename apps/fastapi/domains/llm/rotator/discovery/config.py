@@ -64,4 +64,12 @@ PROVIDERS: dict[str, ProviderConfig] = {
         free_filter    = FreeFilter.ALWAYS_FALSE,
         enabled        = False,    # direct API paid-only; NIM-hosted is the free path
     ),
+    "openrouter": ProviderConfig(
+        name           = "openrouter",
+        url            = "https://openrouter.ai/api/v1/models",
+        key_env        = "OPENROUTER_API_KEY",
+        auth_style     = "bearer",
+        response_shape = "openai",
+        free_filter    = FreeFilter.OPENROUTER_FREE,
+    ),
 }

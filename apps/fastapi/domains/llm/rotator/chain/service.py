@@ -202,6 +202,7 @@ _RR_PROVIDER_CAPS: dict[str, int] = {
     "gemini":     2,
     "deepseek":   2,
     "sambanova":  2,  # 20 RPM — tightest cap
+    "openrouter": 2,  # 50/day free → 2 concurrent
 }
 
 _RR_PROVIDER_INFLIGHT_BY_LOOP: _weakref.WeakKeyDictionary = _weakref.WeakKeyDictionary()
@@ -295,6 +296,18 @@ def _sambanova_entry(group: str, model: str, timeout_s: int = 120) -> dict:
         "litellm_params": {
             "model":       f"sambanova/{model}",
             "api_key":     resolve_key("SAMBANOVA_API_KEY"),
+            "timeout":     timeout_s,
+            "max_retries": 0,
+        },
+    }
+
+
+def _openrouter_entry(group: str, model: str, timeout_s: int = 120) -> dict:
+    return {
+        "model_name": group,
+        "litellm_params": {
+            "model":       f"openrouter/{model}",
+            "api_key":     resolve_key("OPENROUTER_API_KEY"),
             "timeout":     timeout_s,
             "max_retries": 0,
         },
@@ -1869,280 +1882,6 @@ async def pick_synth_deployment_bandit(
     return pick_synth_deployment(seed)
 
 
-# YCS Phase 3 (LLMGraphTransformer entity extraction) shares the dd-synth POOL
-# but lives under a separate bandit dd_process so σ²_ewma evolves on YCS
-# feedback only — DD's mixed-task variance doesn't drag a JSON-strong arm down.
-_YCS_NEO4J_PROCESS = "ycs-neo4j"
-
-
-# Empty since LLMGraphTransformer(ignore_tool_usage=True) fixed cross-provider
-# DynamicGraph schema rejections. Helper kept for hotfix via YCS_NEO4J_ARM_ALLOWLIST.
-_YCS_NEO4J_ARM_BLOCKLIST: frozenset[str] = frozenset()
-
-
-def _ycs_neo4j_filter_candidates(candidates: list[str]) -> list[str]:
-    """Drop blocked arms + drop Groq provider-wide (8K TPM floor < single
-    YCS transcript's 5-10K tokens; chunking rejected at -30% entity quality).
-    YCS_NEO4J_ARM_ALLOWLIST env re-enables specific arms."""
-    allow_env = os.environ.get("YCS_NEO4J_ARM_ALLOWLIST", "").strip()
-    allow = {m.strip() for m in allow_env.split(",") if m.strip()}
-    filtered = [c for c in candidates if c not in _YCS_NEO4J_ARM_BLOCKLIST or c in allow]
-    filtered = [c for c in filtered if not c.startswith("groq/") or c in allow]
-    if not filtered:
-        logger.warning(
-            "[ycs-bandit-pin] blocklist would empty the pool — "
-            "falling back to unfiltered candidates"
-        )
-        return candidates
-    n_dropped = len(candidates) - len(filtered)
-    if n_dropped:
-        logger.info(
-            f"[ycs-bandit-pin] filtered {n_dropped} unfit arm(s) "
-            f"(blocklist + groq TPM floor; {len(filtered)} remain)"
-        )
-    return filtered
-
-
-def _pick_synth_deployment_excluding(
-    seed: int, exclude: frozenset[str] | set[str],
-) -> str:
-    """Round-robin over dd-synth skipping already-tried arms. Without this,
-    a saturated-pool fallthrough re-handed the swap loop an arm it had just
-    circuit-broken. Empty exclusion → unfiltered pool (better repeat than crash)."""
-    entries = _synth_entries_current()
-    if not entries:
-        raise RuntimeError("SYNTH_GROUP is empty — cannot pin a deployment")
-    models = [e["litellm_params"]["model"] for e in entries]
-    pool = [m for m in models if m not in exclude] or models
-    return pool[seed % len(pool)]
-
-
-async def release_ycs_provider_slot(
-    provider: str | None, slot: int | None,
-) -> None:
-    """Release a slot reserved by pick_ycs_neo4j_deployment_bandit. Swap
-    loop calls per-segment so a multi-segment run doesn't hold every tried
-    arm's slot for the full 1800s TTL."""
-    if not provider or slot is None or "REDIS_HOST" not in os.environ:
-        return
-    host = os.environ["REDIS_HOST"].strip()
-    port = os.environ["REDIS_PORT"].strip() if "REDIS_PORT" in os.environ else "6379"
-    password = os.environ["REDIS_PASSWORD"].strip() if "REDIS_PASSWORD" in os.environ else ""
-    url = f"redis://:{password}@{host}:{port}" if password else f"redis://{host}:{port}"
-    rds = redis_aio.from_url(url)
-    try:
-        await bandit.release_provider_slot(provider, slot, redis = rds)
-    except Exception as e:
-        logger.warning(
-            f"[ycs-bandit-pin] provider-slot release failed "
-            f"({provider}:{slot}): {type(e).__name__}: {e}"
-        )
-    finally:
-        try:
-            await rds.aclose()
-        except Exception:
-            pass
-
-
-async def pick_ycs_neo4j_deployment_bandit(
-    seed: int,
-    *,
-    video_count: int = 0,
-    exclude: frozenset[str] | set[str] = frozenset(),
-) -> tuple[str, str | None, int | None]:
-    """Bandit pick for YCS Phase 3. One pick per arm-segment; all transcripts
-    in a segment share the pinned model. `exclude` blocks within-run arm reuse
-    (the bandit's demotion only lands after the reward, which is when the swap
-    happens). Returns (deployment_id, provider, slot); caller MUST call
-    `release_ycs_provider_slot` to avoid 1800s-TTL pool saturation."""
-    await ensure_dynamic_catalog()
-    entries = _synth_entries_current()
-    if not entries:
-        raise RuntimeError("SYNTH_GROUP is empty — cannot pin a YCS deployment")
-    try:
-        if "REDIS_HOST" not in os.environ:
-            raise RuntimeError("REDIS_HOST unset")
-        host = os.environ["REDIS_HOST"].strip()
-        port = os.environ["REDIS_PORT"].strip() if "REDIS_PORT" in os.environ else "6379"
-        password = os.environ["REDIS_PASSWORD"].strip() if "REDIS_PASSWORD" in os.environ else ""
-        url = f"redis://:{password}@{host}:{port}" if password else f"redis://{host}:{port}"
-        rds = redis_aio.from_url(url)
-        try:
-            candidates = [e["litellm_params"]["model"] for e in entries]
-            # never burns a real observation on a known-broken arm.
-            candidates = _ycs_neo4j_filter_candidates(candidates)
-            if exclude:
-                kept = [c for c in candidates if c not in exclude]
-                if kept:
-                    candidates = kept
-                else:
-                    logger.warning(
-                        "[ycs-bandit-pin] exclusion would empty the pool — "
-                        "keeping unfiltered candidates"
-                    )
-            # vault_size analogue → bandit's vault-size buckets (v[4-6]).
-            ctx = bandit.make_context_vector(
-                _YCS_NEO4J_PROCESS,
-                vault_size = video_count,
-            )
-            ranked = await bandit.predict_top_k(
-                _YCS_NEO4J_PROCESS,
-                ctx,
-                candidates,
-                redis = rds,
-                k = 5,
-            )
-            for deployment_id, score, n_obs in ranked:
-                provider = (deployment_id.split("/", 1)[0]
-                            if "/" in deployment_id else deployment_id)
-                provider_cap = _PROVIDER_CHAPTER_CAPS.get(provider, 2)
-                slot = await bandit.try_reserve_provider_slot(
-                    provider,
-                    redis = rds,
-                    max_slots = provider_cap,
-                    ttl_s = 1800,
-                )
-                if slot is None:
-                    logger.info(
-                        f"[ycs-bandit-pin] skipping {deployment_id} (provider "
-                        f"{provider!r} full at {provider_cap}); trying next"
-                    )
-                    continue
-                reserved = await bandit.try_reserve(
-                    deployment_id,
-                    _YCS_NEO4J_PROCESS,
-                    redis = rds,
-                    ttl_s = 1800,
-                )
-                if not reserved:
-                    await bandit.release_provider_slot(
-                        provider, slot, redis = rds,
-                    )
-                    logger.info(
-                        f"[ycs-bandit-pin] skipping {deployment_id} "
-                        f"(deployment reserved); trying next"
-                    )
-                    continue
-                logger.info(
-                    f"[ycs-bandit-pin] picked {deployment_id} "
-                    f"(score={score:.4f}, n_obs={n_obs}, "
-                    f"provider_slot={provider}:{slot}, videos={video_count})"
-                )
-                return deployment_id, provider, slot
-            logger.warning(
-                f"[ycs-bandit-pin] all top-{len(ranked)} slots saturated; "
-                "falling through to round-robin"
-            )
-        finally:
-            try:
-                await rds.aclose()
-            except Exception:
-                pass
-    except Exception as e:
-        logger.warning(
-            f"[ycs-bandit-pin] bandit pick failed ({type(e).__name__}: {e}); "
-            "falling back to round-robin"
-        )
-    return _pick_synth_deployment_excluding(seed, exclude), None, None
-
-
-async def record_ycs_neo4j_reward(
-    deployment_id: str,
-    *,
-    success: bool,
-    latency_s: float | None,
-    error_class: str | None = None,
-    video_count: int = 0,
-    schema_valid: bool = True,
-) -> bool:
-    """Post-task reward update for YCS Neo4j bandit. Failure dominates —
-    a single SIGTERM/timeout kills the reward regardless of how many videos
-    preceded. Best-effort: Redis errors logged + swallowed."""
-    try:
-        if "REDIS_HOST" not in os.environ:
-            return False
-        host = os.environ["REDIS_HOST"].strip()
-        port = os.environ["REDIS_PORT"].strip() if "REDIS_PORT" in os.environ else "6379"
-        password = os.environ["REDIS_PASSWORD"].strip() if "REDIS_PASSWORD" in os.environ else ""
-        url = f"redis://:{password}@{host}:{port}" if password else f"redis://{host}:{port}"
-        rds = redis_aio.from_url(url)
-        try:
-            ctx = bandit.make_context_vector(
-                _YCS_NEO4J_PROCESS,
-                vault_size = video_count,
-            )
-            # ~4 min/video baseline (LLMGraphTransformer over 14-18K chars).
-            expected_latency_s = max(60.0, 240.0 * max(1, video_count))
-            reward = bandit.compose_reward(
-                success = success,
-                schema_valid = schema_valid,
-                latency_s = latency_s,
-                expected_latency_s = expected_latency_s,
-                error_class = error_class,
-            )
-            ok = await bandit.update(
-                deployment_id,
-                _YCS_NEO4J_PROCESS,
-                ctx,
-                reward,
-                redis = rds,
-            )
-            logger.info(
-                f"[ycs-bandit-pin] reward update {deployment_id}: "
-                f"reward={reward:+.3f} (success={success}, "
-                f"latency={latency_s}s, err={error_class})"
-            )
-            return ok
-        finally:
-            # Best-effort release of provider+deployment slot reservations.
-            try:
-                provider = (deployment_id.split("/", 1)[0]
-                            if "/" in deployment_id else deployment_id)
-                # Slot index isn't tracked pick→record; 1800s TTL self-clears.
-                await bandit.release_reservation(
-                    deployment_id,
-                    _YCS_NEO4J_PROCESS,
-                    redis = rds,
-                )
-            except Exception:
-                pass
-            try:
-                await rds.aclose()
-            except Exception:
-                pass
-    except Exception as e:
-        logger.warning(
-            f"[ycs-bandit-pin] reward update failed for {deployment_id}: "
-            f"{type(e).__name__}: {e}"
-        )
-        return False
-
-
-# Longer than synth's 180s — ignore_tool_usage=True emits the whole graph as
-# one JSON; entity-dense transcripts hit 10-15K output tokens. 300s default
-# stays under GRAPH_BATCH_TIMEOUT_S (600s) watchdog.
-YCS_NEO4J_EXTRACT_TIMEOUT_S = max(
-    60, int(os.environ.get("YCS_NEO4J_EXTRACT_TIMEOUT_S", "300") or "300"),
-)
-
-
-def build_ycs_neo4j_pinned_chain(pinned_model: str):
-    """Pinned chain for YCS Phase 3 with extended timeout. Same model keeps
-    independent 180s-synth and 300s-YCS chains (timeout in cache key).
-    Falls back to full synth pool when pinned_model isn't in SYNTH_GROUP."""
-    chain = build_pinned_chain_any(
-        pinned_model,
-        group = SYNTH_GROUP,
-        timeout_override = YCS_NEO4J_EXTRACT_TIMEOUT_S,
-    )
-    if chain is not None:
-        return chain
-    logger.warning(
-        f"[ycs-pin] {pinned_model!r} not in SYNTH_GROUP; falling back to full pool"
-    )
-    return build_synth_pool_chain()
-
-
 def get_parent_group(pinned_or_parent: str | None) -> str | None:
     """Parent pool name for a pinned-group hash, or None."""
     if not pinned_or_parent:
@@ -2313,8 +2052,27 @@ def _record_to_entry(group: str, record, timeout_s: int) -> dict | None:
 
 # Single source of truth — Router model_list AND FGTS-VA bandit candidate
 # pools (the bandit bypasses Router via litellm.acompletion).
+USE_LEGACY_GROUPS = os.getenv("USE_LEGACY_GROUPS", "0") == "1"
+
+def general_entries_current() -> list:
+    """Universal general pool — benchmark-sorted best→worst, single source of truth."""
+    if _dynamic_catalog_initialized and _dynamic_entries.get("general"):
+        return _sort_by_benchmark(_apply_status_filter(_apply_inaccessibility_filter(
+            _apply_selection_filter(_dynamic_entries["general"])
+        )))
+    # facade: dd-all now maps to general, keep compat
+    if _dynamic_catalog_initialized and _dynamic_entries.get("dd-all"):
+        return _sort_by_benchmark(_apply_status_filter(_apply_inaccessibility_filter(
+            _apply_selection_filter(_dynamic_entries["dd-all"])
+        )))
+    return _sort_by_benchmark(_apply_status_filter(_apply_inaccessibility_filter(
+        _apply_selection_filter(_all_entries())
+    )))
+
+
 def _all_entries_current() -> list:
-    """dd-all — dynamic if available else static; trimmed by selection + inaccessibility + status + benchmark sort."""
+    if not USE_LEGACY_GROUPS:
+        return general_entries_current()
     if _dynamic_catalog_initialized and _dynamic_entries.get("dd-all"):
         return _sort_by_benchmark(_apply_status_filter(_apply_inaccessibility_filter(
             _apply_selection_filter(_dynamic_entries["dd-all"])
@@ -2325,7 +2083,8 @@ def _all_entries_current() -> list:
 
 
 def _synth_entries_current() -> list:
-    """dd-synth — dynamic if available else static; trimmed by selection + inaccessibility + status + benchmark."""
+    if not USE_LEGACY_GROUPS:
+        return general_entries_current()
     if _dynamic_catalog_initialized and _dynamic_entries.get("dd-synth"):
         return _sort_by_benchmark(_apply_status_filter(_apply_inaccessibility_filter(
             _apply_selection_filter(_dynamic_entries["dd-synth"])
@@ -2336,7 +2095,8 @@ def _synth_entries_current() -> list:
 
 
 def _reduce_label_entries_current() -> list:
-    """dd-reduce-label — dynamic if available else static; trimmed + benchmark."""
+    if not USE_LEGACY_GROUPS:
+        return general_entries_current()
     if _dynamic_catalog_initialized and _dynamic_entries.get("dd-reduce-label"):
         return _sort_by_benchmark(_apply_status_filter(_apply_inaccessibility_filter(
             _apply_selection_filter(_dynamic_entries["dd-reduce-label"])
@@ -2347,7 +2107,8 @@ def _reduce_label_entries_current() -> list:
 
 
 def _rr_strong_entries_current() -> list:
-    """rr-strong — static only + selection/inaccessibility/status + benchmark sort."""
+    if not USE_LEGACY_GROUPS:
+        return general_entries_current()
     return _sort_by_benchmark(_apply_status_filter(_apply_inaccessibility_filter(
         _apply_selection_filter(_rr_strong_entries())
     )))

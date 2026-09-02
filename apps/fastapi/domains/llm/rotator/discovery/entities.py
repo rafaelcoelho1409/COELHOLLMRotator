@@ -9,6 +9,7 @@ class FreeFilter(Enum):
     MISTRAL           = "mistral"
     GEMINI            = "gemini"
     SAMBANOVA_PRICING = "sambanova_pricing"
+    OPENROUTER_FREE   = "openrouter_free"
     ALWAYS_FALSE      = "always_false"
 
 

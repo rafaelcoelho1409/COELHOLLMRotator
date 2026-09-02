@@ -38,6 +38,17 @@ def _filter_sambanova_pricing(m: dict) -> bool:
         return False
 
 
+def _filter_openrouter_free(m: dict) -> bool:
+    mid = str(m.get("id") or "").strip()
+    if mid.endswith(":free"):
+        return True
+    pricing = m.get("pricing") or {}
+    try:
+        return float(pricing.get("prompt", 1)) == 0.0 and float(pricing.get("completion", 1)) == 0.0
+    except (TypeError, ValueError):
+        return False
+
+
 def _filter_always_false(_m: dict) -> bool:
     return False
 
@@ -47,6 +58,7 @@ FILTER_DISPATCH = {
     FreeFilter.MISTRAL:           _filter_mistral,
     FreeFilter.GEMINI:            _filter_gemini,
     FreeFilter.SAMBANOVA_PRICING: _filter_sambanova_pricing,
+    FreeFilter.OPENROUTER_FREE:   _filter_openrouter_free,
     FreeFilter.ALWAYS_FALSE:      _filter_always_false,
 }
 

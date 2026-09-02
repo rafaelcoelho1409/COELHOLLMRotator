@@ -1,13 +1,9 @@
 from __future__ import annotations
 
 
-GROUP              = "dd-all"
-KEYLM_GROUP        = "dd-keylm"
-REDUCE_LABEL_GROUP = "dd-reduce-label"
-SYNTH_GROUP        = "dd-synth"
+GENERAL_GROUP      = "general"
+GROUP              = GENERAL_GROUP
 DD_EMBED_GROUP     = "dd-embed"
-# dd-all includes thinking/small models that struggle with the 6-phase orchestration prompt; rr-strong excludes them.
-RR_STRONG_GROUP    = "rr-strong"
 
 
 # NIM doesn't expose llama-embed-nemotron-8b at integrate.api.nvidia.com/v1/embeddings.
@@ -22,7 +18,7 @@ _SETTINGS_GEN_REDIS_KEY = "dd:rotator:settings_gen"
 
 # Separate cell from "dd-all" so binary classification doesn't average reward
 # shape with synthesizer cells.
-_JUDGE_KD_PROCESS = "dd-grader"
+_JUDGE_KD_PROCESS = "general-grader"
 
 
 _LITELLM_PREFIX_TO_PROVIDER: dict[str, str] = {
@@ -33,6 +29,7 @@ _LITELLM_PREFIX_TO_PROVIDER: dict[str, str] = {
     "gemini":     "gemini",
     "deepseek":   "deepseek",
     "sambanova":  "sambanova",
+    "openrouter": "openrouter",
 }
 
 _PROVIDER_KEY_ENV: dict[str, str] = {
@@ -43,6 +40,7 @@ _PROVIDER_KEY_ENV: dict[str, str] = {
     "gemini":     "GOOGLE_API_KEY",
     "deepseek":   "DEEPSEEK_API_KEY",
     "sambanova":  "SAMBANOVA_API_KEY",
+    "openrouter": "OPENROUTER_API_KEY",
 }
 
 
@@ -75,3 +73,10 @@ DD_SYNTH_WRITE_HEAVYWEIGHTS: tuple[str, ...] = (
     "magistral-medium",
     "devstral-medium",
 )
+
+# Facade aliases for legacy dd-*|rr-* → general (to be deleted after 100% general traffic)
+KEYLM_GROUP = GENERAL_GROUP
+REDUCE_LABEL_GROUP = GENERAL_GROUP
+SYNTH_GROUP = GENERAL_GROUP
+RR_STRONG_GROUP = GENERAL_GROUP
+DD_ALL_ALIAS = "dd-all"

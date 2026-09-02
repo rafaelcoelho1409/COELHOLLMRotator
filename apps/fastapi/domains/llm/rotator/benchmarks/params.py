@@ -26,6 +26,7 @@ PROVIDER_TIER: dict[str, int] = {
     "gemini":    5,
     "sambanova": 6,
     "deepseek":  7,
+    "openrouter": 3,
 }
 
 
