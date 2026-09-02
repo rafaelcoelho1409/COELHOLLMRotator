@@ -1,26 +1,21 @@
 from __future__ import annotations
 
 
-CACHE_PREFIX = "dd:rotator:pareto:cell:"
-RESERVATION_PREFIX = "dd:rotator:pareto:reserved:"
-PROVIDER_SLOT_PREFIX = "dd:rotator:provider_slot:"
+CACHE_PREFIX = "rotator:bandit:cell:"
+RESERVATION_PREFIX = "rotator:bandit:reserved:"
+PROVIDER_SLOT_PREFIX = "rotator:bandit:provider_slot:"
 
-
-DD_PROCESSES: tuple[str, ...] = (
-    "dd-all",
-    "dd-synth",
-    "dd-reduce-label",
-    "dd-keylm",
-    "dd-embed",
-    "dd-plan",
-    "dd-curator",
-    "dd-grader",
-    "dd-critic",
+TASKS: tuple[str, ...] = (
+    "general",
+    "general-grader",
+    "embed",
 )
-# Non-DD tasks skip the v[7+idx] one-hot; adding to DD_PROCESSES would need a CONTEXT_DIM bump, invalidating Redis CellStates.
-NON_DD_TASKS: tuple[str, ...] = ()
-_DD_PROCESS_IDX = {p: i for i, p in enumerate(DD_PROCESSES)}
-_DD_PROCESS_IDX["general"] = _DD_PROCESS_IDX["dd-all"]  # facade alias, no CONTEXT_DIM bump
+# Preserve old indices to avoid bandit corruption across migration (general=0, embed=4, general-grader=7).
+_TASK_IDX: dict[str, int] = {
+    "general": 0,
+    "general-grader": 7,
+    "embed": 4,
+}
 
 CONTEXT_PROVIDERS: tuple[str, ...] = (
     "groq",
@@ -32,12 +27,12 @@ CONTEXT_PROVIDERS: tuple[str, ...] = (
 _PROVIDER_IDX = {p: i for i, p in enumerate(CONTEXT_PROVIDERS)}
 
 
-def cell_key(deployment: str, dd_process: str) -> str:
-    return f"{CACHE_PREFIX}{deployment}:{dd_process}"
+def cell_key(deployment: str, task: str) -> str:
+    return f"{CACHE_PREFIX}{deployment}:{task}"
 
 
-def reservation_key(deployment: str, dd_process: str) -> str:
-    return f"{RESERVATION_PREFIX}{dd_process}:{deployment}"
+def reservation_key(deployment: str, task: str) -> str:
+    return f"{RESERVATION_PREFIX}{task}:{deployment}"
 
 
 def provider_slot_key(provider: str, slot_idx: int) -> str:

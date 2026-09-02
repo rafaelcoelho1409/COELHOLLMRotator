@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 class CellState:
     """Per-arm posterior state; JSON-serializable for Redis persistence."""
     deployment: str
-    dd_process: str
+    task: str
     A_a: np.ndarray
     b_a: np.ndarray
     n_obs: int
@@ -27,7 +27,7 @@ class CellState:
     sigma_sq_ewma: float = field(default = FGTS_VA.sigma_init_sq)
 
     @classmethod
-    def fresh(cls, deployment: str, dd_process: str, benchmark_prior: float) -> "CellState":
+    def fresh(cls, deployment: str, task: str, benchmark_prior: float) -> "CellState":
         prior = max(0.0, min(1.0, float(benchmark_prior)))
         # Higher prior → tighter posterior; below 0.1 → ridge-only "unknown".
         confidence = max(0.1, prior)
@@ -36,7 +36,7 @@ class CellState:
         b_a = A_a @ theta_init
         return cls(
             deployment = deployment,
-            dd_process = dd_process,
+            task = task,
             A_a = A_a,
             b_a = b_a,
             n_obs = 0,
@@ -48,7 +48,7 @@ class CellState:
     def to_dict(self) -> dict[str, Any]:
         return {
             "deployment":      self.deployment,
-            "dd_process":      self.dd_process,
+            "task":            self.task,
             "A_a":             self.A_a.tolist(),
             "b_a":             self.b_a.tolist(),
             "n_obs":           self.n_obs,
@@ -60,19 +60,20 @@ class CellState:
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "CellState":
         """Re-inits from benchmark_prior on CONTEXT_DIM drift to prevent matmul failure across deploys."""
+        task_val = d.get("task") or ""
         A_a = np.asarray(d["A_a"], dtype=np.float64)
         b_a = np.asarray(d["b_a"], dtype=np.float64)
         expected = (CONTEXT_DIM, CONTEXT_DIM)
         if A_a.shape != expected or b_a.shape != (CONTEXT_DIM,):
             logger.warning(
                 f"[pareto] cell dim drift for {d.get('deployment')!r}/"
-                f"{d.get('dd_process')!r}: stored A_a {A_a.shape} vs current "
+                f"{task_val!r}: stored A_a {A_a.shape} vs current "
                 f"{expected}; re-initializing from benchmark_prior"
             )
-            return cls.fresh(d["deployment"], d["dd_process"], float(d.get("benchmark_prior", 0.0)))
+            return cls.fresh(d["deployment"], task_val, float(d.get("benchmark_prior", 0.0)))
         return cls(
             deployment = d["deployment"],
-            dd_process = d["dd_process"],
+            task = task_val,
             A_a = A_a,
             b_a = b_a,
             n_obs = int(d.get("n_obs", 0)),

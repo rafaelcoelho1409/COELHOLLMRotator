@@ -8,7 +8,7 @@ import numpy as np
 from .config import FGTS_VA, REWARDS
 from .entities import CellState
 from .keys import (
-    _DD_PROCESS_IDX, 
+    _TASK_IDX, 
     _PROVIDER_IDX
 )
 from .params import (
@@ -127,7 +127,7 @@ def score_cell(
 
 
 def make_context_vector(
-    dd_process: str,
+    task: str,
     *,
     chapter_number: int = 0,
     expected_hash_count: int = 0,
@@ -148,7 +148,7 @@ def make_context_vector(
         v[5] = 1.0
     else:
         v[6] = 1.0
-    idx = _DD_PROCESS_IDX.get(dd_process)
+    idx = _TASK_IDX.get(task)
     if idx is not None:
         v[7 + idx] = 1.0
     ts = time_now if time_now is not None else time.time()

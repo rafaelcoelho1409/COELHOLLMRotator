@@ -34,6 +34,9 @@ from domains.llm.rotator.chain import (
     ensure_dynamic_catalog,
 )
 from domains.llm.rotator.discovery import PROVIDERS, list_all_alive_models
+import os
+import httpx
+import redis.asyncio as redis_aio
 
 logger = logging.getLogger(__name__)
 
@@ -110,59 +113,152 @@ def _lc_tool_calls_to_openai(tool_calls: list[dict] | None) -> list[dict] | None
 
 @router.get("/v1/models", response_model=None)
 async def openai_list_models():
-    """Return OpenAI-compatible model list from live discovery."""
-    # Ensure catalog is primed for the UI picker
+    """Unified model catalog — canonical dedup across providers + benchmark ranking.
+
+    SOTA Aug 2026: model-first (not provider-first). Each entry is a canonical model
+    (normalized via ModelGraveyard) with `providers` list, `composite`/`adjusted`
+    from 3 benchmark sources (openlm_arena/oolong_code/openevals) and
+    `routable` flag. Sorted `best→worst` by `adjusted` (TrueSkill μ-3σ),
+    then `composite`, then `PROVIDER_TIER`. Virtual `auto` stays first.
+    """
     try:
         await ensure_dynamic_catalog()
     except Exception:
         pass
 
-    models = []
-    # Virtual rotator entries — always first so ChatOpenAI can use `model="auto"`
     now = int(time.time())
     virtual = [
-        {"id": "auto", "owned_by": "rotator"},
-        {"id": "rotator", "owned_by": "rotator"},
-        {"id": "coelho-llm-rotator", "owned_by": "rotator"},
+        {"id": "auto", "object": "model", "created": now, "owned_by": "rotator"},
+        {"id": "rotator", "object": "model", "created": now, "owned_by": "rotator"},
+        {"id": "coelho-llm-rotator", "object": "model", "created": now, "owned_by": "rotator"},
     ]
-    for v in virtual:
-        models.append({
-            "id": v["id"],
-            "object": "model",
-            "created": now,
-            "owned_by": v["owned_by"],
-        })
 
-    # Live provider models
+    # 1) live discovery fan-out
+    by_provider: dict = {}
     try:
         by_provider = await list_all_alive_models()
-        for provider, records in by_provider.items():
-            for r in records:
-                # r.model_id is bare id, prefix for litellm is handled server-side
-                # Expose both bare and with provider prefix for convenience
-                bare = r.model_id
-                if not bare:
-                    continue
-                models.append({
-                    "id": bare,
-                    "object": "model",
-                    "created": int(r.fetched_at) if r.fetched_at else now,
-                    "owned_by": provider,
-                })
     except Exception as e:
         logger.warning(f"[openai-compat] list_models discovery failed: {e}")
+        by_provider = {}
 
-    # De-duplicate by id, keep first
-    seen = set()
-    uniq = []
-    for m in models:
-        if m["id"] not in seen:
-            seen.add(m["id"])
-            uniq.append(m)
+    # 2) build canonical aggregator: canonical -> {providers: [], bare_ids: [], created: min, record: }
+    from domains.llm.rotator.benchmarks.domain import normalize_model_name, merge_leaderboards, compute_composite_score, true_skill_adjust
+    from domains.llm.rotator.benchmarks.params import STEP_WEIGHTS, PROVIDER_TIER
+    from domains.llm.rotator.benchmarks.service import _SOURCES, _get_cached_leaderboard
+
+    canon_map: dict[str, dict] = {}  # canonical -> {providers: [], bare: [], created: int, raw_ids: []}
+    provider_label_map: dict[str, list[str]] = {}  # canonical -> ["provider/bare", ...]
+    total_bare = 0
+    for provider, records in by_provider.items():
+        for r in records:
+            bare = (r.model_id or "").strip()
+            if not bare:
+                continue
+            total_bare += 1
+            canon = normalize_model_name(bare)
+            # also normalize provider/bare combo for matching
+            # need to keep original bare for provider label
+            label = f"{provider}/{bare}"
+            info = canon_map.setdefault(canon, {"providers": [], "bare_ids": [], "created": int(r.fetched_at) if r.fetched_at else now, "labels": []})
+            if provider not in info["providers"]:
+                info["providers"].append(provider)
+            if bare not in info["bare_ids"]:
+                info["bare_ids"].append(bare)
+            if label not in info["labels"]:
+                info["labels"].append(label)
+            # keep earliest created
+            c = int(r.fetched_at) if r.fetched_at else now
+            if c < info["created"]:
+                info["created"] = c
+
+    # 3) fetch benchmark boards (in-mem → Redis → network) for scoring
+    weights = STEP_WEIGHTS["general"]
+    # redis for bench cache (same as benchmarks router)
+    def _bench_redis():
+        host = os.getenv("REDIS_HOST")
+        if not host or not host.strip():
+            return None
+        try:
+            port = int(os.getenv("REDIS_PORT", "6379"))
+        except ValueError:
+            port = 6379
+        pw = os.getenv("REDIS_PASSWORD", "")
+        url = f"redis://:{pw}@{host}:{port}" if pw else f"redis://{host}:{port}"
+        try:
+            return redis_aio.from_url(url, socket_connect_timeout=2, socket_timeout=3)
+        except Exception:
+            return None
+
+    rds = _bench_redis()
+    boards = []
+    try:
+        async with httpx.AsyncClient() as client:
+            boards_raw = await asyncio.gather(*[_get_cached_leaderboard(name, fn, rds, client) for name, fn in _SOURCES.items()], return_exceptions=True)
+            boards = [b for b in boards_raw if isinstance(b, dict) and b]
+    except Exception as e:
+        logger.debug(f"[openai-compat] benchmark boards fetch failed: {e}")
+        boards = []
+    finally:
+        if rds:
+            try:
+                await rds.aclose()
+            except Exception:
+                pass
+
+    # 4) score each canonical and build model entries
+    ranked = []
+    for canon, info in canon_map.items():
+        scores = merge_leaderboards(canon, boards) if boards else {}
+        composite = compute_composite_score(scores, weights) if scores else 0.0
+        adjusted = true_skill_adjust(composite, len(scores), n_expected=len(boards) if boards else 3) if scores else 0.0
+        # tier = min tier among providers hosting it
+        tier = min((PROVIDER_TIER.get(p, 99) for p in info["providers"]), default=99)
+        ranked.append({
+            "canonical": canon,
+            "info": info,
+            "scores": scores,
+            "composite": composite,
+            "adjusted": adjusted,
+            "tier": tier,
+            "n_sources": len(scores),
+        })
+
+    # 5) sort best→worst: adjusted desc, composite desc, tier asc, canonical asc
+    ranked.sort(key=lambda x: (-x["adjusted"], -x["composite"], x["tier"], x["canonical"]))
+
+    # 6) emit unified list: virtual first, then canonical entries
+    # For OpenAI compat, `id` is the canonical; keep `owned_by: rotator` and add `providers` array
+    # Model-first: one entry per canonical, aggregated across providers, sorted by benchmark
+    data = list(virtual)
+    for r in ranked:
+        canon = r["canonical"]
+        info = r["info"]
+        data.append({
+            "id": canon,
+            "object": "model",
+            "created": info["created"],
+            "owned_by": "rotator",
+            "providers": sorted(info["labels"]),
+            "provider_ids": sorted(info["providers"]),
+            "bare_ids": sorted(info["bare_ids"]),
+            "benchmark": {
+                "composite": round(r["composite"], 4),
+                "adjusted": round(r["adjusted"], 4),
+                "n_sources": r["n_sources"],
+                "scores": r["scores"],
+            },
+            "routable": True,
+            "tier": r["tier"],
+        })
 
     return JSONResponse(content={
         "object": "list",
-        "data": uniq,
+        "data": data,
+        "total": len(data),
+        "canonical_count": len(ranked),
+        "bare_count": total_bare,
+        "providers": sorted(by_provider.keys()),
+        "benchmark_sources": list(_SOURCES.keys()),
     })
 
 

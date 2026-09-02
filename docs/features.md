@@ -7,7 +7,7 @@
 
 1. **Availability — hard gate**
    - `probe_provider_key` `ok` (`200/429`) `has_key` `enabled` (`status/service.py:48` `Secret` `/run/secrets/llm` `10s` watch `60s` re-probe)
-   - `EOL` `410 Gone` `auto-blocklist` (`chain/service.py:773` `mark_inaccessible` `+` `reset_rotator`) + `in-flight caps` (`_RR_PROVIDER_CAPS` `nvidia 4|groq 2`) `429` `cooldown 60s`
+   - `EOL` `410 Gone` `auto-blocklist` (`chain/service.py:773` `mark_inaccessible` `+` `reset_rotator`) + `in-flight caps` (`_PROVIDER_CAPS` `nvidia 4|groq 2`) `429` `cooldown 60s`
    - Not available → never picked
 
 2. **Benchmark Quality — cold-start prior `general` `μ−3σ`**
@@ -17,7 +17,7 @@
    - `GET /benchmarks/leaderboard?limit=200` `best→worst` (`kimi-k3` `0.839` `5` `sources` `nim/kimi-k3` `routable`)
 
 3. **Live Latency — `FGTS-VA` `variance-aware`**
-   - `reward = success × schema_valid × exp(-latency/30s) − error_class` (`chain/service.py:452` `bandit` `redis` `context dd_process`)
+   - `reward = success × schema_valid × exp(-latency/30s) − error_class` (`chain/service.py:452` `bandit` `redis` `context task`)
    - `KV-cache affinity` `57×` `warm` (`Workload–Router–Pool` `2603.21354`) + `TTFT` `prefill|decode` (`Artificial Analysis` `7d`)
    - `σ₀²=1/(n_sources·5)` `±` `true_skill_adjust` → `fast` `mistral 15ms` outranks `slow` `kimi 1.2s` after `~3` calls
 
@@ -36,4 +36,4 @@ curl -s "http://localhost:23030/api/v1/llm/benchmarks/leaderboard?limit=10" | jq
 curl -s http://localhost:23030/api/v1/llm/openai/v1/chat/completions -H "Content-Type: application/json" -d '{"model":"auto","messages":[{"role":"user","content":"hi"}]}' | jq .model
 ```
 
-*Consumer weights (`coding|reasoning`) belong in **consumer** (`Nexus` `RR`), `Rotator` stays `universal` `general` `composite`.*
+*Consumer weights (`coding|reasoning`) belong in **consumer** (`Nexus`), `Rotator` stays `universal` `general` `composite`.*

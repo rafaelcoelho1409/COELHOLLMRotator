@@ -74,22 +74,22 @@ except Exception:
 
 async def get_cell_state(
     deployment: str,
-    dd_process: str,
+    task: str,
     *,
     redis: "redis_aio.Redis | None",
 ) -> CellState | None:
     if redis is None:
         return None
     try:
-        raw = await redis.get(cell_key(deployment, dd_process))
-        if raw is None:
-            return None
-        if isinstance(raw, bytes):
-            raw = raw.decode()
-        return CellState.from_dict(json.loads(raw))
+        raw = await redis.get(cell_key(deployment, task))
+        if raw is not None:
+            if isinstance(raw, bytes):
+                raw = raw.decode()
+            return CellState.from_dict(json.loads(raw))
     except Exception as e:
-        logger.debug(f"[pareto] cell read failed for {deployment}:{dd_process}: {e}")
+        logger.debug(f"[pareto] cell read failed for {deployment}:{task}: {e}")
         return None
+    return None
 
 
 async def save_cell_state(
@@ -101,13 +101,13 @@ async def save_cell_state(
         return False
     try:
         await redis.set(
-            cell_key(state.deployment, state.dd_process),
+            cell_key(state.deployment, state.task),
             json.dumps(state.to_dict()),
             ex = CELL_TTL_S,
         )
         return True
     except Exception as e:
-        logger.debug(f"[pareto] cell write failed for {state.deployment}:{state.dd_process}: {e}")
+        logger.debug(f"[pareto] cell write failed for {state.deployment}:{state.task}: {e}")
         return False
 
 
@@ -145,29 +145,29 @@ async def init_bandit_warm_start(
     if redis is None or not deployments_by_step:
         return 0
     count = 0
-    for dd_process, deployments in deployments_by_step.items():
+    for task, deployments in deployments_by_step.items():
         for deployment_id, score in deployments:
             if not overwrite:
                 existing = await get_cell_state(
                     deployment_id, 
-                    dd_process, 
+                    task, 
                     redis = redis)
                 if existing is not None:
                     continue
-            cell = CellState.fresh(deployment_id, dd_process, score)
+            cell = CellState.fresh(deployment_id, task, score)
             if await save_cell_state(
                 cell, 
                 redis = redis):
                 count += 1
     logger.info(
         f"[pareto] warm-start: initialized {count} cells across "
-        f"{len(deployments_by_step)} dd_processes"
+        f"{len(deployments_by_step)} tasks"
     )
     return count
 
 
 async def predict(
-    dd_process: str,
+    task: str,
     context: np.ndarray,
     candidate_deployments: list[str],
     *,
@@ -179,12 +179,12 @@ async def predict(
         return None, {"reason": "no_candidates"}
     resolved_mode = _resolve_mode(mode)
     cells = await asyncio.gather(
-        *[get_cell_state(d, dd_process, redis = redis) for d in candidate_deployments]
+        *[get_cell_state(d, task, redis = redis) for d in candidate_deployments]
     )
     scored: list[tuple[str, float, float, float, int]] = []
     for deployment, cell in zip(candidate_deployments, cells):
         if cell is None:
-            cell = CellState.fresh(deployment, dd_process, benchmark_prior = 0.0)
+            cell = CellState.fresh(deployment, task, benchmark_prior = 0.0)
         total, exploit, explore = score_cell(
             cell, 
             context, 
@@ -195,7 +195,7 @@ async def predict(
     # Tie-break by lowest n_obs to favor under-sampled arms.
     scored.sort(key = lambda x: (-x[1], x[4], x[0]))
     winner = scored[0]
-    _record_predict(dd_process, resolved_mode)
+    _record_predict(task, resolved_mode)
     _record_score(winner[1], resolved_mode)
     debug = {
         "winner":               winner[0],
@@ -216,7 +216,7 @@ async def predict(
 
 async def update(
     deployment: str,
-    dd_process: str,
+    task: str,
     context: np.ndarray,
     reward: float,
     *,
@@ -225,20 +225,20 @@ async def update(
     """Posterior advance is mode-agnostic; flipping KD_BANDIT_MODE later reuses accumulated state."""
     if redis is None:
         return False
-    cell = await get_cell_state(deployment, dd_process, redis = redis)
+    cell = await get_cell_state(deployment, task, redis = redis)
     if cell is None:
-        cell = CellState.fresh(deployment, dd_process, benchmark_prior = 0.0)
+        cell = CellState.fresh(deployment, task, benchmark_prior = 0.0)
     cell.apply_update(context, reward)
     ok = await save_cell_state(cell, redis = redis)
     if ok:
         outcome = "positive" if reward > 0.5 else ("neutral" if reward > 0 else "negative")
-        _record_update(dd_process, outcome)
+        _record_update(task, outcome)
         _record_sigma_sq(cell.sigma_sq_ewma)
     return ok
 
 
 async def predict_top_k(
-    dd_process: str,
+    task: str,
     context: np.ndarray,
     candidate_deployments: list[str],
     *,
@@ -251,12 +251,12 @@ async def predict_top_k(
         return []
     resolved_mode = _resolve_mode(mode)
     cells = await asyncio.gather(
-        *[get_cell_state(d, dd_process, redis = redis) for d in candidate_deployments]
+        *[get_cell_state(d, task, redis = redis) for d in candidate_deployments]
     )
     scored: list[tuple[str, float, int]] = []
     for deployment, cell in zip(candidate_deployments, cells):
         if cell is None:
-            cell = CellState.fresh(deployment, dd_process, benchmark_prior = 0.0)
+            cell = CellState.fresh(deployment, task, benchmark_prior = 0.0)
         total, _exploit, _bonus = score_cell(
             cell, 
             context, 
@@ -265,7 +265,7 @@ async def predict_top_k(
             alpha = alpha)
         scored.append((deployment, total, cell.n_obs))
     scored.sort(key = lambda x: (-x[1], x[2], x[0]))
-    _record_predict(dd_process, resolved_mode)
+    _record_predict(task, resolved_mode)
     if scored:
         _record_score(scored[0][1], resolved_mode)
     return scored[: max(1, k)]
@@ -273,7 +273,7 @@ async def predict_top_k(
 
 async def try_reserve(
     deployment: str,
-    dd_process: str,
+    task: str,
     *,
     redis: "redis_aio.Redis | None",
     ttl_s: int = 60,
@@ -283,7 +283,7 @@ async def try_reserve(
         return True
     try:
         claimed = await redis.set(
-            reservation_key(deployment, dd_process), 
+            reservation_key(deployment, task), 
             "1", 
             ex = ttl_s, 
             nx = True)
@@ -294,14 +294,14 @@ async def try_reserve(
 
 async def release_reservation(
     deployment: str,
-    dd_process: str,
+    task: str,
     *,
     redis: "redis_aio.Redis | None",
 ) -> None:
     if redis is None:
         return
     try:
-        await redis.delete(reservation_key(deployment, dd_process))
+        await redis.delete(reservation_key(deployment, task))
     except Exception:
         pass
 

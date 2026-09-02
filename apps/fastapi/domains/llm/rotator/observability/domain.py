@@ -6,7 +6,7 @@ from typing import Any
 
 from .keys import (
     BANDIT_ATTEMPT,
-    BANDIT_DD_PROCESS,
+    BANDIT_TASK,
     BANDIT_DEPLOYMENT_ID,
     BANDIT_ERROR_CLASS,
     BANDIT_FALLBACK,
@@ -258,7 +258,7 @@ def build_bandit_attempt_attrs(
     *,
     deployment_id: str,
     attempt: int,
-    dd_process: str | None = None,
+    task: str | None = None,
     latency_s: float | None = None,
     reward: float | None = None,
     error_class: str | None = None,
@@ -270,8 +270,8 @@ def build_bandit_attempt_attrs(
         BANDIT_PROVIDER:      provider_for_deployment(deployment_id),
         BANDIT_ATTEMPT:       int(attempt),
     }
-    if dd_process:
-        attrs[BANDIT_DD_PROCESS] = dd_process
+    if task:
+        attrs[BANDIT_TASK] = task
     if latency_s is not None:
         attrs[BANDIT_LATENCY_S] = float(latency_s)
     if reward is not None:
@@ -285,12 +285,12 @@ def build_bandit_attempt_attrs(
 
 def build_bandit_cascade_attrs(
     *,
-    dd_process: str,
+    task: str,
     total_attempts: int | None = None,
     fallback: str | None = None,
 ) -> dict[str, Any]:
     """Parent cascade-span attrs; total_attempts + fallback updated at end."""
-    attrs: dict[str, Any] = {BANDIT_DD_PROCESS: dd_process}
+    attrs: dict[str, Any] = {BANDIT_TASK: task}
     if total_attempts is not None:
         attrs[BANDIT_TOTAL_ATTEMPTS] = int(total_attempts)
     if fallback:

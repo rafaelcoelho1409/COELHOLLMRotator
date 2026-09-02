@@ -327,7 +327,7 @@ async def rank_for_step(
     *,
     redis: redis_aio.Redis | None = None,
 ) -> list[tuple[Any, float]]:
-    weights = STEP_WEIGHTS.get(step, STEP_WEIGHTS["dd-all"])
+    weights = STEP_WEIGHTS.get(step, STEP_WEIGHTS["general"])
     if not alive_models:
         return []
     canonicals = await asyncio.gather(

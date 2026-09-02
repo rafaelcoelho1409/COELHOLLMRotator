@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from .keys import (
-    DD_SYNTH_WRITE_HEAVYWEIGHTS,
+    WRITE_HEAVYWEIGHTS,
     _LITELLM_PREFIX_TO_PROVIDER,
     _NON_CHAT_MARKERS,
     _PROVIDER_KEY_ENV,
@@ -43,7 +43,7 @@ def is_eol_error(exc: Exception) -> bool:
 
 
 def is_heavyweight(deployment_id: str) -> bool:
-    return any(s in deployment_id for s in DD_SYNTH_WRITE_HEAVYWEIGHTS)
+    return any(s in deployment_id for s in WRITE_HEAVYWEIGHTS)
 
 
 def is_non_chat_model(model_id: str) -> bool:

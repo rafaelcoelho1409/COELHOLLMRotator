@@ -1,6 +1,6 @@
 """Benchmarks leaderboard — unified view over OpenLM Arena / oolong / OpenEvals.
 
-Universal Rotator: single general composite (no dd-* steps).
+Universal Rotator: single general composite.
 
 - GET /benchmarks?canonical=qwen/qwen3.5-397b          → scores for one model
 - GET /benchmarks/leaderboard?limit=20&format=json|csv  → ranked best→worst

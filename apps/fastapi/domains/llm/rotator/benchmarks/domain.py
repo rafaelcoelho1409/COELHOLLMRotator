@@ -52,6 +52,9 @@ _ALIAS_TO_CANONICAL: dict[str, str] = {
 def normalize_model_name(name: str) -> str:
     """L1→L4 SOTA: provider_alias + routing/vendor strip + trailing version loop + alias DB + size-safe."""
     s = (name or "").strip().lower()
+    # strip benchmark markers like ✅ ⭐ etc that leak from leaderboard tables
+    for marker in ("✅", "✔", "⭐", "🔥", "🏆", "★"):
+        s = s.replace(marker, "")
     # provider alias prefix (ModelGraveyard)
     for k, v in _PROVIDER_ALIASES.items():
         if s.startswith(k + "/"):

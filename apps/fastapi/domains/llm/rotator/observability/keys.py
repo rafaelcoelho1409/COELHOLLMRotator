@@ -26,7 +26,7 @@ GEN_AI_RESPONSE_RERANK_COUNT      = "gen_ai.response.rerank.count"
 GEN_AI_RESPONSE_RERANK_TOP_SCORE  = "gen_ai.response.rerank.top_score"
 
 # Bandit-cascade attrs ride alongside gen_ai.* on per-attempt spans — used to
-# slice LangFuse generations by arm/reward/error_class/dd_process.
+# slice LangFuse generations by arm/reward/error_class/task.
 BANDIT_DEPLOYMENT_ID = "bandit.deployment_id"
 BANDIT_PROVIDER      = "bandit.provider"
 BANDIT_ATTEMPT       = "bandit.attempt"
@@ -34,7 +34,7 @@ BANDIT_LATENCY_S     = "bandit.latency_s"
 BANDIT_REWARD        = "bandit.reward"
 BANDIT_ERROR_CLASS   = "bandit.error_class"
 BANDIT_SCHEMA_VALID  = "bandit.schema_valid"
-BANDIT_DD_PROCESS    = "bandit.dd_process"
+BANDIT_TASK          = "bandit.task"
 BANDIT_TOTAL_ATTEMPTS = "bandit.total_attempts"
 BANDIT_FALLBACK      = "bandit.fallback"
 

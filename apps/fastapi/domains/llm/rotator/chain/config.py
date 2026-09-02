@@ -18,7 +18,7 @@ DYNAMIC_STEPS: dict[str, DynamicStepConfig] = {
 @dataclass(frozen = True, slots = True)
 class JudgeConfig:
     """general-grader cells kept separate from synthesizer cells — binary vs continuous reward shape."""
-    dd_process:         str   = "general-grader"
+    task:               str   = "general-grader"
     expected_latency_s: float = 4.0
     bandit_top_k:       int   = 10
 

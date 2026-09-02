@@ -3,22 +3,22 @@ from __future__ import annotations
 
 GENERAL_GROUP      = "general"
 GROUP              = GENERAL_GROUP
-DD_EMBED_GROUP     = "dd-embed"
+EMBED_GROUP        = "embed"
 
 
 # NIM doesn't expose llama-embed-nemotron-8b at integrate.api.nvidia.com/v1/embeddings.
-DD_EMBED_MODEL_NAME  = "nvidia/llama-nemotron-embed-1b-v2"
-DD_RERANK_MODEL_NAME = "nvidia/llama-nemotron-rerank-1b-v2"
+EMBED_MODEL_NAME   = "nvidia/llama-nemotron-embed-1b-v2"
+RERANK_MODEL_NAME  = "nvidia/llama-nemotron-rerank-1b-v2"
 
 _NIM_RERANK_BASE = "https://ai.api.nvidia.com/v1/retrieval"
 
 
-_SETTINGS_GEN_REDIS_KEY = "dd:rotator:settings_gen"
+_SETTINGS_GEN_REDIS_KEY = "rotator:settings_gen"
 
 
-# Separate cell from "dd-all" so binary classification doesn't average reward
+# Separate cell from "general" so binary classification doesn't average reward
 # shape with synthesizer cells.
-_JUDGE_KD_PROCESS = "general-grader"
+_JUDGE_TASK = "general-grader"
 
 
 _LITELLM_PREFIX_TO_PROVIDER: dict[str, str] = {
@@ -53,14 +53,14 @@ _RESPONSE_FORMAT_SAFE_PROVIDERS: tuple[str, ...] = (
 )
 
 
-# "embed" filter never affects the rotator's own embedder (lives in dd-embed, a separate pool).
+# "embed" filter never affects the rotator's own embedder (lives in embed, a separate pool).
 _NON_CHAT_MARKERS: tuple[str, ...] = (
     "embed", "bge", "e5-", "-e5", "gte-", "rerank", "deplot", "ocr",
     "whisper", "clip", "siglip", "-vit", "vit-", "guard", "reward",
 )
 
 # Separate σ²_ewma evolution from workhorses; bandit picks best heavyweight by writer-specific reward.
-DD_SYNTH_WRITE_HEAVYWEIGHTS: tuple[str, ...] = (
+WRITE_HEAVYWEIGHTS: tuple[str, ...] = (
     "llama-4-maverick",
     "qwen3.5-397b",
     "z-ai/glm-5.1",
@@ -73,10 +73,3 @@ DD_SYNTH_WRITE_HEAVYWEIGHTS: tuple[str, ...] = (
     "magistral-medium",
     "devstral-medium",
 )
-
-# Facade aliases for legacy dd-*|rr-* → general (to be deleted after 100% general traffic)
-KEYLM_GROUP = GENERAL_GROUP
-REDUCE_LABEL_GROUP = GENERAL_GROUP
-SYNTH_GROUP = GENERAL_GROUP
-RR_STRONG_GROUP = GENERAL_GROUP
-DD_ALL_ALIAS = "dd-all"

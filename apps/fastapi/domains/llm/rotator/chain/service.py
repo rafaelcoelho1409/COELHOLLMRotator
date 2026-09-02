@@ -93,21 +93,18 @@ from .domain import (
     selection_allows,
 )
 from .keys import (
-    DD_EMBED_GROUP,
-    DD_EMBED_MODEL_NAME,
-    DD_RERANK_MODEL_NAME,
+    EMBED_GROUP,
+    EMBED_MODEL_NAME,
+    RERANK_MODEL_NAME,
+    GENERAL_GROUP,
     GROUP,
-    KEYLM_GROUP,
-    REDUCE_LABEL_GROUP,
-    RR_STRONG_GROUP,
-    SYNTH_GROUP,
-    _JUDGE_KD_PROCESS,
+    _JUDGE_TASK,
     _NIM_RERANK_BASE,
     _RESPONSE_FORMAT_SAFE_PROVIDERS,
     _SETTINGS_GEN_REDIS_KEY,
 )
 from .params import (
-    DD_EMBED_BATCH_SIZE,
+    EMBED_BATCH_SIZE,
     _ARM_COOLDOWN_S,
     _DYNAMIC_MIN_PARAM_B,
     _DYNAMIC_QUALITY_FLOOR_STEPS,
@@ -134,7 +131,7 @@ logger = logging.getLogger(__name__)
 try:
     import openai as _openai_sdk
 
-    if not getattr(_openai_sdk, "_dd_no_sdk_retries", False):
+    if not getattr(_openai_sdk, "_rotator_no_sdk_retries", False):
         _orig_async_openai_init = _openai_sdk.AsyncOpenAI.__init__
         _orig_sync_openai_init = _openai_sdk.OpenAI.__init__
 
@@ -148,7 +145,7 @@ try:
 
         _openai_sdk.AsyncOpenAI.__init__ = _async_openai_init_no_retries
         _openai_sdk.OpenAI.__init__ = _sync_openai_init_no_retries
-        _openai_sdk._dd_no_sdk_retries = True
+        _openai_sdk._rotator_no_sdk_retries = True
         logger.info("[llm-chain] OpenAI SDK hidden retries disabled (max_retries=0)")
 except Exception as _sdk_patch_err:
     logger.warning(
@@ -172,29 +169,29 @@ _settings_gen_read_at: float = 0.0
 _arm_cooldown: dict[str, float] = {}
 
 
-# WeakKeyDict: semaphore is GC'd with the loop (each Celery task gets its own asyncio.run).
+# WeakKeyDict: semaphore is GC'd with the loop (each worker gets its own asyncio loop).
 import weakref as _weakref
-_RR_LLM_SEM_BY_LOOP: _weakref.WeakKeyDictionary = _weakref.WeakKeyDictionary()
+_LLM_SEM_BY_LOOP: _weakref.WeakKeyDictionary = _weakref.WeakKeyDictionary()
 
 
-def _get_rr_llm_sem() -> asyncio.Semaphore:
-    """KD_RR_SEM env overrides (default 8); per-loop so each Celery asyncio.run() gets its own."""
+def _get_llm_sem() -> asyncio.Semaphore:
+    """KD_LLM_SEM env overrides (default 8); per-loop so each worker gets its own. Legacy KD_LLM_SEM supported."""
     loop = asyncio.get_running_loop()
-    sem = _RR_LLM_SEM_BY_LOOP.get(loop)
+    sem = _LLM_SEM_BY_LOOP.get(loop)
     if sem is None:
         try:
-            v = int(os.environ.get("KD_RR_SEM", "8"))
+            v = int(os.environ.get("KD_LLM_SEM", os.environ.get("KD_GENERAL_SEM", "8")))
         except (TypeError, ValueError):
             v = 8
         v = max(1, v)
         sem = asyncio.Semaphore(v)
-        _RR_LLM_SEM_BY_LOOP[loop] = sem
-        logger.info(f"[rr-bandit] LLM semaphore initialized: {v} concurrent")
+        _LLM_SEM_BY_LOOP[loop] = sem
+        logger.info(f"[bandit] LLM semaphore initialized: {v} concurrent")
     return sem
 
 
 # Per-provider in-flight caps; bandit skips at-cap providers (bypasses Router, so routing_strategy can't help).
-_RR_PROVIDER_CAPS: dict[str, int] = {
+_PROVIDER_CAPS: dict[str, int] = {
     "nvidia_nim": 4,  # 40 RPM ÷ ~20s
     "groq":       2,  # 30 RPM peak; tighter cap absorbs bursts
     "cerebras":   2,
@@ -205,16 +202,16 @@ _RR_PROVIDER_CAPS: dict[str, int] = {
     "openrouter": 2,  # 50/day free → 2 concurrent
 }
 
-_RR_PROVIDER_INFLIGHT_BY_LOOP: _weakref.WeakKeyDictionary = _weakref.WeakKeyDictionary()
+_PROVIDER_INFLIGHT_BY_LOOP: _weakref.WeakKeyDictionary = _weakref.WeakKeyDictionary()
 
 
-def _get_rr_provider_inflight() -> dict[str, int]:
-    """Per-loop dict tracking in-flight RR LLM calls by provider."""
+def _get_provider_inflight() -> dict[str, int]:
+    """Per-loop dict tracking in-flight LLM calls by provider."""
     loop = asyncio.get_running_loop()
-    state = _RR_PROVIDER_INFLIGHT_BY_LOOP.get(loop)
+    state = _PROVIDER_INFLIGHT_BY_LOOP.get(loop)
     if state is None:
         state = {}
-        _RR_PROVIDER_INFLIGHT_BY_LOOP[loop] = state
+        _PROVIDER_INFLIGHT_BY_LOOP[loop] = state
     return state
 
 
@@ -314,52 +311,13 @@ def _openrouter_entry(group: str, model: str, timeout_s: int = 120) -> dict:
     }
 
 
-def _keylm_entries() -> list:
-    """3B is fallback for 28-cluster bursts that saturate NIM 40 RPM."""
-    return [
-        _nim_entry(KEYLM_GROUP, "meta/llama-3.2-1b-instruct", timeout_s = 30),
-        _nim_entry(KEYLM_GROUP, "meta/llama-3.2-3b-instruct", timeout_s = 45),
-    ]
-
-
-def _reduce_label_entries() -> list:
-    """Non-reasoning only; fastest LPU/TPU first."""
-    return [
-        _groq_entry(REDUCE_LABEL_GROUP,    "llama-3.3-70b-versatile",                    timeout_s=60),
-        _gemini_entry(REDUCE_LABEL_GROUP,  "gemini-3.1-flash-lite",                      timeout_s=60),
-        _nim_entry(REDUCE_LABEL_GROUP,     "nvidia/nemotron-3-super-120b-a12b",          timeout_s=90),
-        _nim_entry(REDUCE_LABEL_GROUP,     "openai/gpt-oss-120b",                        timeout_s=90),
-        _nim_entry(REDUCE_LABEL_GROUP,     "mistralai/mistral-large-3-675b-instruct-2512", timeout_s=90),
-        _mistral_entry(REDUCE_LABEL_GROUP, "mistral-large-latest",                      timeout_s=90),
-        _mistral_entry(REDUCE_LABEL_GROUP, "mistral-small-latest",                      timeout_s=60),
-        _nim_entry(REDUCE_LABEL_GROUP,     "meta/llama-4-maverick-17b-128e-instruct",    timeout_s=90),
-    ]
-
-
-def _synth_entries() -> list:
-    """Reasoning-first: structured-output completeness gates post-synth audit."""
-    return [
-        _nim_entry(SYNTH_GROUP, "moonshotai/kimi-k2.6",                         timeout_s = 180),
-        _nim_entry(SYNTH_GROUP, "z-ai/glm-5.1",                                 timeout_s = 180),
-        _nim_entry(SYNTH_GROUP, "minimaxai/minimax-m2.7",                       timeout_s = 180),
-        _nim_entry(SYNTH_GROUP, "deepseek-ai/deepseek-v4-flash",                timeout_s = 180),
-        _mistral_entry(SYNTH_GROUP, "mistral-large-latest",                     timeout_s = 120),
-        _nim_entry(SYNTH_GROUP, "mistralai/mistral-large-3-675b-instruct-2512", timeout_s = 120),
-        _nim_entry(SYNTH_GROUP, "nvidia/nemotron-3-super-120b-a12b",            timeout_s = 120),
-        _nim_entry(SYNTH_GROUP, "openai/gpt-oss-120b",                          timeout_s = 120),
-        _mistral_entry(SYNTH_GROUP, "mistral-medium-latest",                    timeout_s = 120),
-        _mistral_entry(SYNTH_GROUP, "mistral-small-latest",                     timeout_s = 90),
-        _nim_entry(SYNTH_GROUP, "meta/llama-4-maverick-17b-128e-instruct",      timeout_s = 120),
-    ]
-
-
 def _embed_entries() -> list:
     """Single-entry: rotating providers breaks cosine geometry. NIM requires encoding_format."""
     return [
         {
-            "model_name": DD_EMBED_GROUP,
+            "model_name": EMBED_GROUP,
             "litellm_params": {
-                "model":           f"nvidia_nim/{DD_EMBED_MODEL_NAME}",
+                "model":           f"nvidia_nim/{EMBED_MODEL_NAME}",
                 "api_key":         resolve_key("NVIDIA_API_KEY"),
                 "timeout":         120,
                 "max_retries":     0,
@@ -387,15 +345,15 @@ def embed_via_router_sync(
     router = _get_router()
     clean = [t if (t and t.strip()) else " " for t in texts]
     out: list[list[float]] = []
-    for start in range(0, len(clean), DD_EMBED_BATCH_SIZE):
-        batch = clean[start:start + DD_EMBED_BATCH_SIZE]
+    for start in range(0, len(clean), EMBED_BATCH_SIZE):
+        batch = clean[start:start + EMBED_BATCH_SIZE]
         with genai_embedding_span_sync(
-            request_model = DD_EMBED_GROUP,
+            request_model = EMBED_GROUP,
             texts         = batch,
             input_type    = input_type,
         ) as span:
             response = router.embedding(
-                model = DD_EMBED_GROUP,
+                model = EMBED_GROUP,
                 input = batch,
                 encoding_format = "float",
                 input_type = input_type,
@@ -405,7 +363,7 @@ def embed_via_router_sync(
         out.extend(item["embedding"] for item in response["data"])
     if len(out) != len(texts):
         raise RuntimeError(
-            f"dd-embed: rotator returned {len(out)} vectors for {len(texts)} inputs"
+            f"embed: rotator returned {len(out)} vectors for {len(texts)} inputs"
         )
     return out
 
@@ -423,15 +381,15 @@ async def embed_via_router_async(
     clean = [t if (t and t.strip()) else " " for t in texts]
     total = len(clean)
     out: list[list[float]] = []
-    for start in range(0, total, DD_EMBED_BATCH_SIZE):
-        batch = clean[start:start + DD_EMBED_BATCH_SIZE]
+    for start in range(0, total, EMBED_BATCH_SIZE):
+        batch = clean[start:start + EMBED_BATCH_SIZE]
         async with genai_embedding_span(
-            request_model = DD_EMBED_GROUP,
+            request_model = EMBED_GROUP,
             texts         = batch,
             input_type    = input_type,
         ) as span:
             response = await router.aembedding(
-                model = DD_EMBED_GROUP,
+                model = EMBED_GROUP,
                 input = batch,
                 encoding_format = "float",
                 input_type = input_type,
@@ -449,7 +407,7 @@ async def embed_via_router_async(
                 pass
     if len(out) != len(texts):
         raise RuntimeError(
-            f"dd-embed: rotator returned {len(out)} vectors for {len(texts)} inputs"
+            f"embed: rotator returned {len(out)} vectors for {len(texts)} inputs"
         )
     return out
 
@@ -475,21 +433,13 @@ async def chat_judge_async(
             max_tokens = max_tokens,
         )
         span.attach_chat_response(response)
-        _bump_dd_llm_counter(response, deployment=GROUP)
+        _bump_llm_counter(response, deployment=GROUP)
     return (response.choices[0].message.content or "").strip()
 
 
-def _bump_dd_llm_counter(response, deployment: str | None = None) -> dict | None:
-    """No-ops unless a Planner/Synth node wrapper has set attribution context."""
-    try:
-        from domains.dd.runtime.llm_counter import bump_current_call
-        return bump_current_call(response=response, deployment=deployment)
-    except Exception as e:
-        logger.warning(
-            f"[dd-llm-counter] rotator bump failed: "
-            f"{type(e).__name__}: {e}"
-        )
-        return None
+def _bump_llm_counter(response, deployment: str | None = None) -> dict | None:
+    """Stub for LLM usage attribution (kept for compatibility)."""
+    return None
 
 
 async def _redis_for_bandit():
@@ -524,13 +474,13 @@ async def chat_judge_bandit_async(
     temperature: float = 0.0,
     timeout_s: float = 30.0,
     expected_pattern: str | None = None,
-    dd_process: str | None = None,
+    task: str | None = None,
     candidate_filter=None,
     response_format: dict | None = None,
 ) -> tuple[str, dict]:
     """Bypasses Router shuffle; response_format only for _RESPONSE_FORMAT_SAFE_PROVIDERS."""
     await ensure_dynamic_catalog()
-    effective_process = dd_process or _JUDGE_KD_PROCESS
+    effective_task = task or _JUDGE_TASK
     _prune_arm_cooldown()
     rds = await _redis_for_bandit()
     if rds is None:
@@ -543,20 +493,20 @@ async def chat_judge_bandit_async(
             "attempts":   0,
             "latency_s":  None,
             "reward":     None,
-            "dd_process": effective_process,
+            "task": effective_task,
             "fallback":   "no_redis",
         }
-    candidates = [e["litellm_params"]["model"] for e in _all_entries_current()]
+    candidates = [e["litellm_params"]["model"] for e in general_entries_current()]
     if candidate_filter is not None:
         filtered = [c for c in candidates if candidate_filter(c)]
         if filtered:
             candidates = filtered
         # Empty-filter → keep full set rather than 503.
-    ctx = bandit.make_context_vector(effective_process)
+    ctx = bandit.make_context_vector(effective_task)
     pattern = re.compile(expected_pattern) if expected_pattern else None
     try:
         ranked = await bandit.predict_top_k(
-            effective_process,
+            effective_task,
             ctx,
             candidates,
             redis = rds,
@@ -569,12 +519,12 @@ async def chat_judge_bandit_async(
             if filtered:
                 if len(filtered) < len(ranked):
                     logger.info(
-                        f"[dd-judge-bandit] cooldown filtered "
-                        f"{len(ranked) - len(filtered)} arm(s) for {effective_process}"
+                        f"[judge-bandit] cooldown filtered "
+                        f"{len(ranked) - len(filtered)} arm(s) for {effective_task}"
                     )
                 ranked = filtered
     except Exception as e:
-        logger.warning(f"[dd-judge-bandit] predict_top_k failed: {e}; falling back to router-shuffle")
+        logger.warning(f"[judge-bandit] predict_top_k failed: {e}; falling back to router-shuffle")
         try:
             await rds.aclose()
         except Exception:
@@ -593,7 +543,7 @@ async def chat_judge_bandit_async(
     last_error: str | None = None
     attempts = 0
     messages = [{"role": "user", "content": prompt}]
-    async with genai_bandit_cascade_span(dd_process = effective_process) as cascade:
+    async with genai_bandit_cascade_span(task = effective_task) as cascade:
         try:
             for deployment_id, _ucb, _n_obs in ranked:
                 attempts += 1
@@ -607,7 +557,7 @@ async def chat_judge_bandit_async(
                 async with genai_bandit_attempt_span(
                     deployment_id = deployment_id,
                     attempt       = attempts,
-                    dd_process    = effective_process,
+                    task    = effective_task,
                     messages      = messages,
                     temperature   = temperature,
                     max_tokens    = max_tokens,
@@ -628,7 +578,7 @@ async def chat_judge_bandit_async(
                             acompletion_kwargs["response_format"] = response_format
                         response = await litellm.acompletion(**acompletion_kwargs)
                         attempt_span.attach_chat_response(response)
-                        dd_counter = _bump_dd_llm_counter(
+                        llm_counter = _bump_llm_counter(
                             response,
                             deployment=deployment_id,
                         )
@@ -643,7 +593,7 @@ async def chat_judge_bandit_async(
                     except Exception as e:
                         error_class = classify_error(e)
                         last_error = f"{type(e).__name__}: {str(e)[:120]}"
-                        # 429 → cooldown across all dd_process cascades in this window.
+                        # 429 → cooldown across all task cascades in this window.
                         if error_class == "rate_limit":
                             _arm_cooldown[deployment_id] = time.monotonic() + _ARM_COOLDOWN_S
                     latency_s = float(time.monotonic() - t0)
@@ -664,7 +614,7 @@ async def chat_judge_bandit_async(
                 try:
                     await bandit.update(
                         deployment_id,
-                        effective_process,
+                        effective_task,
                         ctx,
                         reward,
                         redis = rds)
@@ -676,8 +626,8 @@ async def chat_judge_bandit_async(
                         "attempts":   attempts,
                         "latency_s":  latency_s,
                         "reward":     reward,
-                        "dd_process": effective_process,
-                        "usage":       dd_counter,
+                        "task": effective_task,
+                        "usage":       llm_counter,
                     }
                 # Success+bad-schema: return; cascade can't fix a schema quirk.
                 if success:
@@ -687,11 +637,11 @@ async def chat_judge_bandit_async(
                         "latency_s":      latency_s,
                         "reward":         reward,
                         "schema_invalid": True,
-                        "dd_process":     effective_process,
-                        "usage":          dd_counter,
+                        "task":     effective_task,
+                        "usage":          llm_counter,
                     }
             raise RuntimeError(
-                f"dd-judge-bandit: all {attempts} ranked deployments failed; "
+                f"judge-bandit: all {attempts} ranked deployments failed; "
                 f"last error: {last_error}"
             )
         finally:
@@ -709,10 +659,10 @@ async def rerank_via_router_async(
     if not documents:
         return []
     api_key = _require_nim_key()
-    model_slug = DD_RERANK_MODEL_NAME.split("/", 1)[-1]
+    model_slug = RERANK_MODEL_NAME.split("/", 1)[-1]
     url = f"{_NIM_RERANK_BASE}/nvidia/{model_slug}/reranking"
     payload = {
-        "model":    DD_RERANK_MODEL_NAME,
+        "model":    RERANK_MODEL_NAME,
         "query":    {"text": query},
         "passages": [{"text": d} for d in documents],
     }
@@ -722,10 +672,10 @@ async def rerank_via_router_async(
         "Content-Type":  "application/json",
     }
     async with genai_rerank_span(
-        request_model = DD_RERANK_MODEL_NAME,
+        request_model = RERANK_MODEL_NAME,
         query         = query,
         documents     = documents,
-        system        = system_for_deployment(DD_RERANK_MODEL_NAME),
+        system        = system_for_deployment(RERANK_MODEL_NAME),
     ) as span:
         async with httpx.AsyncClient(timeout = 60.0) as client:
             resp = await client.post(url, json = payload, headers = headers)
@@ -737,21 +687,6 @@ async def rerank_via_router_async(
             pairs = pairs[:top_n]
         span.attach_rerank_response(pairs)
     return pairs
-
-
-def _rr_strong_entries() -> list:
-    """Smaller arms excluded (phantom-completion); SambaNova/Cerebras "free" tier requires payment / returns 404."""
-    return [
-        _nim_entry(RR_STRONG_GROUP,     "moonshotai/kimi-k2.6",                          timeout_s = 120),
-        _nim_entry(RR_STRONG_GROUP,     "z-ai/glm-5.1",                                  timeout_s = 120),
-        _nim_entry(RR_STRONG_GROUP,     "minimaxai/minimax-m2.7",                        timeout_s = 120),
-        _nim_entry(RR_STRONG_GROUP,     "deepseek-ai/deepseek-v4-flash",                 timeout_s = 120),
-        _nim_entry(RR_STRONG_GROUP,     "nvidia/nemotron-3-super-120b-a12b",             timeout_s = 120),
-        _nim_entry(RR_STRONG_GROUP,     "openai/gpt-oss-120b",                           timeout_s = 120),
-        _nim_entry(RR_STRONG_GROUP,     "mistralai/mistral-large-3-675b-instruct-2512",  timeout_s = 120),
-        _mistral_entry(RR_STRONG_GROUP, "mistral-large-latest",                          timeout_s = 120),
-        _mistral_entry(RR_STRONG_GROUP, "mistral-medium-latest",                         timeout_s = 120),
-    ]
 
 
 def _all_entries() -> list:
@@ -915,8 +850,7 @@ _DOES_NOT_EXIST_RE = _re.compile(
 
 
 _GROUP_NAMES: frozenset[str] = frozenset({
-    "dd-all", "rr-strong", "dd-synth", "dd-reduce-label",
-    "dd-keylm", "dd-embed",
+    "general", "embed",
 })
 
 
@@ -1297,10 +1231,10 @@ class _RotatorAutoRetryRouter(ChatLiteLLMRouter):
 class _BanditRoutedRotatorChain(_RotatorAutoRetryRouter):
     """FGTS-VA per LLM turn with tool_calls preserved; falls back to simple-shuffle when bandit infra unavailable."""
 
-    # Separate cell from dd-* so RR rewards/penalties don't leak into DD scoring.
-    _RR_DD_PROCESS = RR_STRONG_GROUP
+    # Separate cell from general so GENERAL rewards/penalties don't leak into general scoring.
+    _BANDIT_TASK = GENERAL_GROUP
 
-    _RR_EXPECTED_LATENCY_S: float = 30.0
+    _GENERAL_EXPECTED_LATENCY_S: float = 30.0
 
     async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):
         messages = _flatten_thinking_content(messages)
@@ -1321,16 +1255,16 @@ class _BanditRoutedRotatorChain(_RotatorAutoRetryRouter):
             )
 
         try:
-            entries = _rr_strong_entries_current()
+            entries = general_entries_current()
             if not entries:
                 return await super()._agenerate(
                     messages, stop=stop, run_manager=run_manager, **kwargs,
                 )
             candidates = [e["litellm_params"]["model"] for e in entries]
-            ctx = bandit.make_context_vector(self._RR_DD_PROCESS)
+            ctx = bandit.make_context_vector(self._BANDIT_TASK)
             try:
                 ranked = await bandit.predict_top_k(
-                    self._RR_DD_PROCESS,
+                    self._BANDIT_TASK,
                     ctx,
                     candidates,
                     redis = rds,
@@ -1338,7 +1272,7 @@ class _BanditRoutedRotatorChain(_RotatorAutoRetryRouter):
                 )
             except Exception as e:
                 logger.warning(
-                    f"[rr-bandit] predict_top_k failed: "
+                    f"[bandit] predict_top_k failed: "
                     f"{type(e).__name__}: {e}; falling back to simple-shuffle"
                 )
                 return await super()._agenerate(
@@ -1354,7 +1288,7 @@ class _BanditRoutedRotatorChain(_RotatorAutoRetryRouter):
                 ]
                 if live and len(live) < len(ranked):
                     logger.info(
-                        f"[rr-bandit] cooldown dropped "
+                        f"[bandit] cooldown dropped "
                         f"{len(ranked) - len(live)} of {len(ranked)} arms"
                     )
                 if live:
@@ -1369,7 +1303,7 @@ class _BanditRoutedRotatorChain(_RotatorAutoRetryRouter):
                 oai_messages = convert_to_openai_messages(messages)
             except Exception as e:
                 logger.warning(
-                    f"[rr-bandit] message conversion failed: "
+                    f"[bandit] message conversion failed: "
                     f"{type(e).__name__}: {e}; falling back to simple-shuffle"
                 )
                 return await super()._agenerate(
@@ -1390,17 +1324,17 @@ class _BanditRoutedRotatorChain(_RotatorAutoRetryRouter):
             attempts = 0
             inflight = _get_rr_provider_inflight()
             async with genai_bandit_cascade_span(
-                dd_process = self._RR_DD_PROCESS,
+                task = self._BANDIT_TASK,
             ) as cascade:
                 try:
                     for deployment_id, _score, _n_obs in ranked:
                         provider = (
                             deployment_id.split("/", 1)[0] if "/" in deployment_id else ""
                         )
-                        provider_cap = _RR_PROVIDER_CAPS.get(provider, 8)
+                        provider_cap = _PROVIDER_CAPS.get(provider, 8)
                         if inflight.get(provider, 0) >= provider_cap:
                             logger.debug(
-                                f"[rr-bandit] {deployment_id} skipped — provider "
+                                f"[bandit] {deployment_id} skipped — provider "
                                 f"{provider!r} at cap {provider_cap}"
                             )
                             continue
@@ -1419,7 +1353,7 @@ class _BanditRoutedRotatorChain(_RotatorAutoRetryRouter):
                             async with genai_bandit_attempt_span(
                                 deployment_id = deployment_id,
                                 attempt       = attempts,
-                                dd_process    = self._RR_DD_PROCESS,
+                                task    = self._BANDIT_TASK,
                                 messages      = oai_messages,
                                 temperature   = temperature,
                                 max_tokens    = max_tokens,
@@ -1447,11 +1381,11 @@ class _BanditRoutedRotatorChain(_RotatorAutoRetryRouter):
                                     ):
                                         acompletion_kwargs["response_format"] = response_format
                                         # NIM: attach nvext.guided_json so XGrammar enforces
-                                        # schema at decode time. KD_RR_GUIDED_JSON gates.
+                                        # schema at decode time. KD_GUIDED_JSON gates.
                                         if (
                                             provider == "nvidia_nim"
                                             and os.environ.get(
-                                                "KD_RR_GUIDED_JSON", "true"
+                                                "KD_GUIDED_JSON", "true"
                                             ).strip().lower() not in ("0", "false", "no", "off")
                                             and isinstance(response_format, dict)
                                         ):
@@ -1487,13 +1421,13 @@ class _BanditRoutedRotatorChain(_RotatorAutoRetryRouter):
                                         )
                                         try:
                                             await bandit.update(
-                                                deployment_id, self._RR_DD_PROCESS,
+                                                deployment_id, self._BANDIT_TASK,
                                                 ctx, reward, redis = rds,
                                             )
                                         except Exception:
                                             pass
                                         logger.warning(
-                                            f"[rr-bandit] {deployment_id} empty generations; "
+                                            f"[bandit] {deployment_id} empty generations; "
                                             f"cascading"
                                         )
                                         continue
@@ -1503,7 +1437,7 @@ class _BanditRoutedRotatorChain(_RotatorAutoRetryRouter):
                                         success            = True,
                                         schema_valid       = True,
                                         latency_s          = latency_s,
-                                        expected_latency_s = self._RR_EXPECTED_LATENCY_S,
+                                        expected_latency_s = self._GENERAL_EXPECTED_LATENCY_S,
                                         error_class        = None,
                                     )
                                     update_bandit_outcome(
@@ -1515,13 +1449,13 @@ class _BanditRoutedRotatorChain(_RotatorAutoRetryRouter):
                                     )
                                     try:
                                         await bandit.update(
-                                            deployment_id, self._RR_DD_PROCESS,
+                                            deployment_id, self._BANDIT_TASK,
                                             ctx, reward, redis = rds,
                                         )
                                     except Exception:
                                         pass
                                     logger.debug(
-                                        f"[rr-bandit] {deployment_id} → ok "
+                                        f"[bandit] {deployment_id} → ok "
                                         f"(latency_s={latency_s:.2f}, attempt={attempts}, "
                                         f"reward={reward:.3f})"
                                     )
@@ -1539,7 +1473,7 @@ class _BanditRoutedRotatorChain(_RotatorAutoRetryRouter):
                                         success            = False,
                                         schema_valid       = False,
                                         latency_s          = latency_s,
-                                        expected_latency_s = self._RR_EXPECTED_LATENCY_S,
+                                        expected_latency_s = self._GENERAL_EXPECTED_LATENCY_S,
                                         error_class        = error_class,
                                     )
                                     update_bandit_outcome(
@@ -1551,13 +1485,13 @@ class _BanditRoutedRotatorChain(_RotatorAutoRetryRouter):
                                     )
                                     try:
                                         await bandit.update(
-                                            deployment_id, self._RR_DD_PROCESS,
+                                            deployment_id, self._BANDIT_TASK,
                                             ctx, reward, redis = rds,
                                         )
                                     except Exception:
                                         pass
                                     logger.info(
-                                        f"[rr-bandit] {deployment_id} → {error_class}: "
+                                        f"[bandit] {deployment_id} → {error_class}: "
                                         f"{type(e).__name__}; cascading"
                                     )
                                     continue
@@ -1567,7 +1501,7 @@ class _BanditRoutedRotatorChain(_RotatorAutoRetryRouter):
                             )
 
                     logger.warning(
-                        f"[rr-bandit] all {attempts} ranked arms failed (last: "
+                        f"[bandit] all {attempts} ranked arms failed (last: "
                         f"{type(last_err).__name__ if last_err else 'None'}); "
                         f"falling back to simple-shuffle Router"
                     )
@@ -1706,13 +1640,9 @@ def _get_router() -> Router:
                 if pw:
                     redis_kwargs["redis_password"] = pw
     _router_instance = Router(
-        # All groups share cooldown circuit-breaker + Redis state; infra pools (dd-keylm, dd-embed) are unconditional.
+        # Universal pool: general chat + embed (rerank uses direct httpx). Single source of truth.
         model_list=(
-            _all_entries_current()
-            + _reduce_label_entries_current()
-            + _synth_entries_current()
-            + _rr_strong_entries_current()
-            + _keylm_entries()
+            general_entries_current()
             + _embed_entries()
         ),
         routing_strategy = "simple-shuffle",
@@ -1738,17 +1668,17 @@ def build_llm_fallback_chain(groq_timeout_s: int = 120, nim_timeout_s: int = 300
     )
 
 
-def build_rr_strong_chain():
-    """Rollback target for KD_RR_BANDIT_CHAT=false."""
+def build_general_chain():
+    """Rollback target for KD_GENERAL_BANDIT_CHAT=false."""
     return _RotatorAutoRetryRouter(
-        router = _get_router(), model = RR_STRONG_GROUP, temperature = 0.0,
+        router = _get_router(), model = GENERAL_GROUP, temperature = 0.0,
     )
 
 
-def build_rr_strong_chain_bandit():
+def build_general_chain_bandit():
     """FGTS-VA per turn; falls back to simple-shuffle when Redis unavailable or all arms exhausted."""
     return _BanditRoutedRotatorChain(
-        router = _get_router(), model = RR_STRONG_GROUP, temperature = 0.0,
+        router = _get_router(), model = GENERAL_GROUP, temperature = 0.0,
     )
 
 
@@ -1759,127 +1689,7 @@ def build_resolver_llm_chain(groq_timeout_s: int = 30, nim_timeout_s: int = 60):
         temperature = 0.0)
 
 
-def build_synth_fallback_chain(groq_timeout_s: int = 120, nim_timeout_s: int = 300):
-    use_synth_pool = (
-        "DD_USE_SYNTH_POOL" in os.environ
-        and os.environ["DD_USE_SYNTH_POOL"].strip().lower() in ("1", "true", "yes")
-    )
-    target_group = SYNTH_GROUP if use_synth_pool else GROUP
-    return ChatLiteLLMRouter(
-        router = _get_router(), 
-        model = target_group, 
-        temperature = 0.0)
 
-
-def build_synth_pool_chain():
-    return ChatLiteLLMRouter(
-        router = _get_router(),
-        model = SYNTH_GROUP,
-        temperature = 0.0)
-
-
-# Without pinning, refine iters saw different models per iter — "you missed hash X" feedback was actionless.
-def pick_synth_deployment(seed: int) -> str:
-    """Fallback when bandit pinning fails."""
-    entries = _synth_entries_current()
-    if not entries:
-        raise RuntimeError("SYNTH_GROUP is empty — cannot pin a deployment")
-    return entries[seed % len(entries)]["litellm_params"]["model"]
-
-
-async def pick_synth_deployment_bandit(
-    seed: int,
-    *,
-    chapter_number: int = 0,
-    expected_hash_count: int = 0,
-    vault_size: int = 0,
-    has_thinking_budget: bool = False,
-) -> str:
-    """Top-K cascade with atomic provider-slot + deployment-slot reservations; falls back to round-robin."""
-    await ensure_dynamic_catalog()
-    entries = _synth_entries_current()
-    if not entries:
-        raise RuntimeError("SYNTH_GROUP is empty — cannot pin a deployment")
-    try:
-        if "REDIS_HOST" not in os.environ:
-            raise RuntimeError("REDIS_HOST unset")
-        host = os.environ["REDIS_HOST"].strip()
-        port = os.environ["REDIS_PORT"].strip() if "REDIS_PORT" in os.environ else "6379"
-        password = os.environ["REDIS_PASSWORD"].strip() if "REDIS_PASSWORD" in os.environ else ""
-        url = f"redis://:{password}@{host}:{port}" if password else f"redis://{host}:{port}"
-        rds = redis_aio.from_url(url)
-        try:
-            candidates = [e["litellm_params"]["model"] for e in entries]
-            ctx = bandit.make_context_vector(
-                "dd-synth",
-                chapter_number = chapter_number,
-                expected_hash_count = expected_hash_count,
-                vault_size = vault_size,
-                has_thinking_budget = has_thinking_budget,
-            )
-            # K=5 — alternatives for provider-aware reservation cascade.
-            ranked = await bandit.predict_top_k(
-                "dd-synth", 
-                ctx, 
-                candidates, 
-                redis = rds, 
-                k = 5,
-            )
-            for deployment_id, ucb_score, n_obs in ranked:
-                provider = (deployment_id.split("/", 1)[0]
-                            if "/" in deployment_id else deployment_id)
-                provider_cap = _PROVIDER_CHAPTER_CAPS.get(provider, 2)
-                slot = await bandit.try_reserve_provider_slot(
-                    provider, 
-                    redis = rds, 
-                    max_slots = provider_cap, 
-                    ttl_s = 1800,
-                )
-                if slot is None:
-                    logger.info(
-                        f"[bandit-pin] ch{chapter_number:02d} skipping "
-                        f"{deployment_id} (provider {provider!r} full at "
-                        f"{provider_cap} chapters); trying next"
-                    )
-                    continue
-                reserved = await bandit.try_reserve(
-                    deployment_id, 
-                    "dd-synth", 
-                    redis = rds, 
-                    ttl_s = 1800,
-                )
-                if not reserved:
-                    # Release provider slot — another chapter holds the lock.
-                    await bandit.release_provider_slot(
-                        provider, 
-                        slot, 
-                        redis = rds)
-                    logger.info(
-                        f"[bandit-pin] ch{chapter_number:02d} skipping "
-                        f"{deployment_id} (deployment reserved); trying next"
-                    )
-                    continue
-                logger.info(
-                    f"[bandit-pin] ch{chapter_number:02d} → {deployment_id} "
-                    f"(ucb={ucb_score:.4f}, n_obs={n_obs}, "
-                    f"provider_slot={provider}:{slot})"
-                )
-                return deployment_id
-            logger.warning(
-                f"[bandit-pin] ch{chapter_number:02d} all top-{len(ranked)} "
-                f"slots saturated; falling through to round-robin"
-            )
-        finally:
-            try:
-                await rds.aclose()
-            except Exception:
-                pass
-    except Exception as e:
-        logger.warning(
-            f"[bandit-pin] ch{chapter_number:02d} bandit pick failed "
-            f"({type(e).__name__}: {e}); falling back to round-robin"
-        )
-    return pick_synth_deployment(seed)
 
 
 def get_parent_group(pinned_or_parent: str | None) -> str | None:
@@ -1892,19 +1702,15 @@ def get_parent_group(pinned_or_parent: str | None) -> str | None:
 def get_entries_for_group(group: str) -> list:
     """Current entries for a parent pool — bandit cascade uses this when the
     caller's llm is a pinned (1-entry) chain."""
-    if group == SYNTH_GROUP:
-        return _synth_entries_current()
-    if group == REDUCE_LABEL_GROUP:
-        return _reduce_label_entries_current()
     if group == GROUP:
-        return _all_entries_current()
-    return []
+        return general_entries_current()
+    return general_entries_current()
 
 
 def _build_pinned_chain(pinned_group: str, fresh_entry: dict):
     """Single-deployment Router with PIN-tuned retry discipline:
     TimeoutErrorRetries=0 (no other arm to rotate to → guaranteed-futile);
-    RateLimitErrorRetries=2 (NIM shares key across DD+YCS, bursts pass);
+    RateLimitErrorRetries=2 (NIM shares key across providers, bursts pass);
     BadRequestErrorRetries=0 (schema rejections are deterministic);
     num_retries=1 for unenumerated classes. OpenAI SDK retries are killed
     process-wide by the top-of-module patch, not here."""
@@ -1935,10 +1741,9 @@ def build_pinned_chain_any(
     group: str | None = None,
     timeout_override: int | None = None,
 ):
-    """Generalized pinning. Searches dd-synth → dd-reduce-label → dd-all
+    """Generalized pinning. Searches general pool
     unless `group` specified. None when not found. timeout_override
-    participates in the cache key so the same model can hold both 180s-synth
-    and 300s-YCS chains."""
+    participates in the cache key so the same model can hold both timeout variants."""
     cache_key = (
         pinned_model if timeout_override is None
         else f"{pinned_model}@to{timeout_override}"
@@ -1946,12 +1751,8 @@ def build_pinned_chain_any(
     if cache_key in _pinned_chain_cache:
         return _pinned_chain_cache[cache_key]
     search_groups: list[tuple[str, list[dict]]] = []
-    if group is None or group == SYNTH_GROUP:
-        search_groups.append((SYNTH_GROUP, _synth_entries_current()))
-    if group is None or group == REDUCE_LABEL_GROUP:
-        search_groups.append((REDUCE_LABEL_GROUP, _reduce_label_entries_current()))
     if group is None or group == GROUP:
-        search_groups.append((GROUP, _all_entries_current()))
+        search_groups.append((GROUP, general_entries_current()))
     matching_entry: dict | None = None
     matched_group: str | None = None
     for grp_name, entries in search_groups:
@@ -1964,7 +1765,7 @@ def build_pinned_chain_any(
             break
     if matching_entry is None:
         return None
-    pinned_group = f"dd-pinned-{abs(hash(cache_key)) & 0xFFFFFF:06x}"
+    pinned_group = f"pinned-{abs(hash(cache_key)) & 0xFFFFFF:06x}"
     litellm_params = dict(matching_entry["litellm_params"])
     if timeout_override is not None:
         litellm_params["timeout"] = timeout_override
@@ -1978,63 +1779,9 @@ def build_pinned_chain_any(
     return chain
 
 
-def build_synth_pinned_chain(pinned_model: str):
-    """Single-deployment chain pinned to dd-synth `pinned_model`. Falls back
-    to full pool if not present (e.g. disabled mid-run)."""
-    if pinned_model in _pinned_chain_cache:
-        return _pinned_chain_cache[pinned_model]
-    matching = [
-        e for e in _synth_entries_current()
-        if e["litellm_params"]["model"] == pinned_model
-    ]
-    if not matching:
-        logger.warning(f"[synth-pin] {pinned_model!r} not in SYNTH_GROUP; falling back to full pool")
-        return build_synth_pool_chain()
-    pinned_group = f"dd-synth-pinned-{abs(hash(pinned_model)) & 0xFFFFFF:06x}"
-    fresh_entry = {
-        "model_name":    pinned_group,
-        "litellm_params": dict(matching[0]["litellm_params"]),
-    }
-    chain = _build_pinned_chain(pinned_group, fresh_entry)
-    _pinned_chain_cache[pinned_model] = chain
-    _pinned_to_parent[pinned_group] = SYNTH_GROUP
-    return chain
 
 
-def build_refine_llm_chain(groq_timeout_s: int = 120, nim_timeout_s: int = 300):
-    """Self-Refine refiner at T=0.7 (Madaan 2023 §2). dd-all."""
-    return ChatLiteLLMRouter(
-        router=_get_router(),
-        model = GROUP,
-        temperature = 0.7)
 
-
-def build_curator_llm(timeout_s: int = 600):
-    """Curator chain — dd-all at T=0.0."""
-    return ChatLiteLLMRouter(
-        router = _get_router(), 
-        model = GROUP, 
-        temperature = 0.0)
-
-
-def build_keylm_chain():
-    """Tiny-LM chain for KeyLLM cluster labels — NIM Llama-3.2-1B primary, 3B fallback."""
-    return ChatLiteLLMRouter(
-        router = _get_router(),
-        model = KEYLM_GROUP,
-        temperature = 0.0)
-
-
-def build_reduce_label_chain():
-    """Non-reasoning chain for REDUCE labeling/ordering. T=1.0 — Gemini-3
-    infinite-loops at T<1.0. json_schema mode keeps non-Gemini output valid.
-    Uses _RotatorAutoRetryRouter so real deployment id surfaces in
-    response_metadata (UI Model chip)."""
-    return _RotatorAutoRetryRouter(
-        router = _get_router(),
-        model = REDUCE_LABEL_GROUP,
-        temperature = 1.0,
-    )
 
 
 def _record_to_entry(group: str, record, timeout_s: int) -> dict | None:
@@ -2060,57 +1807,8 @@ def general_entries_current() -> list:
         return _sort_by_benchmark(_apply_status_filter(_apply_inaccessibility_filter(
             _apply_selection_filter(_dynamic_entries["general"])
         )))
-    # facade: dd-all now maps to general, keep compat
-    if _dynamic_catalog_initialized and _dynamic_entries.get("dd-all"):
-        return _sort_by_benchmark(_apply_status_filter(_apply_inaccessibility_filter(
-            _apply_selection_filter(_dynamic_entries["dd-all"])
-        )))
     return _sort_by_benchmark(_apply_status_filter(_apply_inaccessibility_filter(
         _apply_selection_filter(_all_entries())
-    )))
-
-
-def _all_entries_current() -> list:
-    if not USE_LEGACY_GROUPS:
-        return general_entries_current()
-    if _dynamic_catalog_initialized and _dynamic_entries.get("dd-all"):
-        return _sort_by_benchmark(_apply_status_filter(_apply_inaccessibility_filter(
-            _apply_selection_filter(_dynamic_entries["dd-all"])
-        )))
-    return _sort_by_benchmark(_apply_status_filter(_apply_inaccessibility_filter(
-        _apply_selection_filter(_all_entries())
-    )))
-
-
-def _synth_entries_current() -> list:
-    if not USE_LEGACY_GROUPS:
-        return general_entries_current()
-    if _dynamic_catalog_initialized and _dynamic_entries.get("dd-synth"):
-        return _sort_by_benchmark(_apply_status_filter(_apply_inaccessibility_filter(
-            _apply_selection_filter(_dynamic_entries["dd-synth"])
-        )))
-    return _sort_by_benchmark(_apply_status_filter(_apply_inaccessibility_filter(
-        _apply_selection_filter(_synth_entries())
-    )))
-
-
-def _reduce_label_entries_current() -> list:
-    if not USE_LEGACY_GROUPS:
-        return general_entries_current()
-    if _dynamic_catalog_initialized and _dynamic_entries.get("dd-reduce-label"):
-        return _sort_by_benchmark(_apply_status_filter(_apply_inaccessibility_filter(
-            _apply_selection_filter(_dynamic_entries["dd-reduce-label"])
-        )))
-    return _sort_by_benchmark(_apply_status_filter(_apply_inaccessibility_filter(
-        _apply_selection_filter(_reduce_label_entries())
-    )))
-
-
-def _rr_strong_entries_current() -> list:
-    if not USE_LEGACY_GROUPS:
-        return general_entries_current()
-    return _sort_by_benchmark(_apply_status_filter(_apply_inaccessibility_filter(
-        _apply_selection_filter(_rr_strong_entries())
     )))
 
 
@@ -2131,9 +1829,9 @@ async def init_dynamic_catalog(force: bool = False) -> bool:
     'all'-mode providers feed top-K; 'custom'-mode model_ids ALWAYS kept (never
     cut). Idempotent unless force=True. Failure → static fallback."""
     global _dynamic_catalog_initialized, _dynamic_built_gen
-    if "DD_DYNAMIC_CATALOG" in os.environ:
-        if os.environ["DD_DYNAMIC_CATALOG"].strip().lower() not in ("1", "true", "yes", "on"):
-            logger.info("[llm-chain] DD_DYNAMIC_CATALOG=0 — using static catalog")
+    if "ROTATOR_DYNAMIC_CATALOG" in os.environ:
+        if os.environ["ROTATOR_DYNAMIC_CATALOG"].strip().lower() not in ("1", "true", "yes", "on"):
+            logger.info("[llm-chain] ROTATOR_DYNAMIC_CATALOG=0 — using static catalog")
             return False
     if _dynamic_catalog_initialized and not force:
         return True
@@ -2195,7 +1893,7 @@ async def init_dynamic_catalog(force: bool = False) -> bool:
                     else:
                         unscored_all.append(record)
                 # Gates on auto-fill (custom exempt): non-chat exclusion
-                # everywhere; capability floor on dd-all/dd-synth only.
+                # everywhere; capability floor on general only.
                 fill = scored_all + unscored_all
                 orig_fill = fill
                 n_nonchat = sum(1 for r in fill if is_non_chat_model(r.model_id))
@@ -2283,8 +1981,8 @@ async def init_dynamic_catalog(force: bool = False) -> bool:
 async def ensure_dynamic_catalog() -> None:
     """Lazy (re)build on hot path when settings-gen moved. Throttled Redis
     gen read; this propagates /settings changes cluster-wide without a redeploy."""
-    if "DD_DYNAMIC_CATALOG" in os.environ:
-        if os.environ["DD_DYNAMIC_CATALOG"].strip().lower() not in ("1", "true", "yes", "on"):
+    if "ROTATOR_DYNAMIC_CATALOG" in os.environ:
+        if os.environ["ROTATOR_DYNAMIC_CATALOG"].strip().lower() not in ("1", "true", "yes", "on"):
             return
     # Rebuild only when gen MOVES — failed attempts stamped this gen so we
     # don't hammer discovery while keyless.
@@ -2307,7 +2005,7 @@ def init_dynamic_catalog_sync() -> bool:
 # Periodic discovery refresh for EOL resilience. Combined with the EOL-broadened
 # _RotatorAutoRetryRouter: call-time catches mark inaccessible; periodic
 # refreshes drop cycled-out models from /v1/models. Default 900s; env
-# DD_CATALOG_REFRESH_INTERVAL_S overrides (0 disables).
+# ROTATOR_CATALOG_REFRESH_INTERVAL_S overrides (0 disables).
 _CATALOG_REFRESH_INTERVAL_S: int = 900
 
 _catalog_refresh_task: asyncio.Task | None = None
@@ -2315,9 +2013,9 @@ _catalog_refresh_task: asyncio.Task | None = None
 
 def _catalog_refresh_interval() -> int:
     interval = _CATALOG_REFRESH_INTERVAL_S
-    if "DD_CATALOG_REFRESH_INTERVAL_S" in os.environ:
+    if "ROTATOR_CATALOG_REFRESH_INTERVAL_S" in os.environ:
         try:
-            interval = int(os.environ["DD_CATALOG_REFRESH_INTERVAL_S"])
+            interval = int(os.environ["ROTATOR_CATALOG_REFRESH_INTERVAL_S"])
         except (TypeError, ValueError):
             pass
     return interval

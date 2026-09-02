@@ -1,18 +1,10 @@
 from __future__ import annotations
 
 from .domain import is_heavyweight
-from .keys import DD_EMBED_MODEL_NAME
+from .keys import EMBED_MODEL_NAME
 from .service import (
-    build_curator_llm,
-    build_keylm_chain,
     build_llm_fallback_chain,
     build_pinned_chain_any,
-    build_reduce_label_chain,
-    build_refine_llm_chain,
-    build_resolver_llm_chain,
-    build_synth_fallback_chain,
-    build_synth_pinned_chain,
-    build_synth_pool_chain,
     chat_judge_async,
     chat_judge_bandit_async,
     embed_via_router_async,
@@ -22,8 +14,6 @@ from .service import (
     get_parent_group,
     init_dynamic_catalog,
     init_dynamic_catalog_sync,
-    pick_synth_deployment,
-    pick_synth_deployment_bandit,
     rerank_via_router_async,
     reset_rotator,
     start_catalog_refresh_loop,
@@ -31,17 +21,9 @@ from .service import (
 )
 
 __all__ = [
-    "DD_EMBED_MODEL_NAME",
-    "build_curator_llm",
-    "build_keylm_chain",
+    "EMBED_MODEL_NAME",
     "build_llm_fallback_chain",
     "build_pinned_chain_any",
-    "build_reduce_label_chain",
-    "build_refine_llm_chain",
-    "build_resolver_llm_chain",
-    "build_synth_fallback_chain",
-    "build_synth_pinned_chain",
-    "build_synth_pool_chain",
     "chat_judge_async",
     "chat_judge_bandit_async",
     "embed_via_router_async",
@@ -52,8 +34,6 @@ __all__ = [
     "init_dynamic_catalog",
     "init_dynamic_catalog_sync",
     "is_heavyweight",
-    "pick_synth_deployment",
-    "pick_synth_deployment_bandit",
     "rerank_via_router_async",
     "reset_rotator",
     "start_catalog_refresh_loop",
