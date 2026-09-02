@@ -1,0 +1,58 @@
+# =============================================================================
+# ARGOCD APPLICATION - COELHO LLM Rotator
+# =============================================================================
+# SCOPE: This file targets the COELHO Cloud production cluster. The
+#   `repoURL` below points at the in-cluster GitLab service, which only
+#   exists on COELHO Cloud (the gitlab module is intentionally NOT included
+#   in the COELHO LLM Rotator standalone infrastructure port).
+#
+# For the COELHO LLM Rotator standalone k3d cluster: do NOT apply this file. Use
+#   `skaffold run` instead (after `kubectl config use-context k3d-coelho-llm-rotator`)
+#   — the `coelho-llm-rotator` profile in skaffold.yaml auto-activates via kubeContext
+#   and handles build, push, and helm install in one cross-platform command.
+#   See COELHONexus docs/K8S-DUAL-CLUSTER-FLEX-2026-06-19.md for the architecture rationale.
+#
+# Apply to COELHO Cloud's ArgoCD:
+#   kubectl apply -f k8s/argocd/dev/application.yaml
+#
+# Namespaces:
+#   - coelho-llm-rotator-dev: Skaffold local development (ports 23030-23039)
+#   - coelho-llm-rotator: ArgoCD production (ports 23000-23019)
+# =============================================================================
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: coelho-llm-rotator
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    # GitLab repository URL — MUST be the in-cluster service URL so it
+    # prefix-matches the `argocd-gitlab-repo-creds` repo-creds Secret (the PAT is
+    # registered under this URL). Using the Tailscale HTTPS URL clones anonymously
+    # → "HTTP Basic: Access denied" on the private repo. Also avoids the TLS hop.
+    repoURL: http://gitlab-webservice-default.gitlab.svc.cluster.local:8181/root/COELHOLLMRotator.git
+    targetRevision: master
+    path: k8s/helm
+    helm:
+      releaseName: coelho-llm-rotator
+      valueFiles:
+        - values.yaml
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: coelho-llm-rotator
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - PruneLast=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m

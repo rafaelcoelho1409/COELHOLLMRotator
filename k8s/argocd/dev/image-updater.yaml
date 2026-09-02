@@ -1,0 +1,35 @@
+# =============================================================================
+# ARGOCD IMAGE UPDATER CR - COELHO LLM Rotator
+# =============================================================================
+# SCOPE: pairs with application.yaml — both are COELHO Cloud-only because
+#   they expect ArgoCD + GitLab + the coelho-cloud-registry in-cluster
+#   hostname. None of those exist on the COELHO LLM Rotator standalone k3d cluster.
+#
+# For COELHO LLM Rotator: `skaffold run` handles build → push → deploy end-to-end
+#   (cross-platform, no shell scripts). No Image Updater needed because
+#   Skaffold rewrites image refs to unique sha256 tags on every build, which
+#   forces a fresh rollout automatically.
+#
+# Apply to COELHO Cloud's ArgoCD:
+#   kubectl apply -f k8s/argocd/dev/
+#
+# Flow on COELHO Cloud: GitLab CI builds → Registry → Image Updater detects → ArgoCD deploys
+# =============================================================================
+apiVersion: argocd-image-updater.argoproj.io/v1alpha1
+kind: ImageUpdater
+metadata:
+  name: coelho-llm-rotator
+  namespace: argocd
+spec:
+  applicationRefs:
+    - namePattern: coelho-llm-rotator
+      images:
+        - alias: fastapi
+          imageName: coelho-cloud-registry:5000/coelho-llm-rotator-fastapi:latest
+          commonUpdateSettings:
+            updateStrategy: digest
+          manifestTargets:
+            helm:
+              spec: fastapi.image
+  writeBackConfig:
+    method: argocd
