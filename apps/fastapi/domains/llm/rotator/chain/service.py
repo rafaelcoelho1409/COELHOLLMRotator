@@ -28,19 +28,40 @@ from langchain_litellm.chat_models.litellm_router import (
 litellm.modify_params = True
 litellm.drop_params   = True
 
+# SOTA Aug 2026: Groq compound (tool-use aggregator) not in litellm 1.83.13 pricing
+# → Router._pre_call_checks:get_model_info raises ValueError before any call.
+# Register zero-cost entries so Router treats them as valid and lets Groq's API
+# decide (they will 404/permissions_error and then be demoted by retry policy).
+for _m in ("groq/compound", "groq/compound-mini"):
+    if _m not in litellm.model_cost:
+        litellm.model_cost[_m] = {
+            "input_cost_per_token": 0.0,
+            "output_cost_per_token": 0.0,
+            "litellm_provider": "groq",
+            "mode": "chat",
+            "max_tokens": 8192,
+            "max_input_tokens": 8192,
+            "supports_function_calling": True,
+            "supports_tool_choice": True,
+        }
+
 
 from domains.llm.rotator import bandit, benchmarks, discovery
 
 
 def resolve_key(env_name: str) -> str:
-    """Read API key from env/Secret.
-
-    Primary: exact upper-snake (NVIDIA_API_KEY) as used in .env.
-    Fallback: lower-dash form (nvidia-api-key) produced by upload_env_to_k3d.py
-    (`to_secret_key` lowercases + replaces '_' with '-'), and lower variant.
-    This lets `envFrom: secretRef: coelho-llm-rotator-secret` work without
-    renaming the secret keys.
-    """
+    """Read API key from env/Secret volume (/run/secrets/llm) with fallbacks."""
+    # 1. Secret volume file (auto-updated by kubelet, no restart needed)
+    for p in (f"/run/secrets/llm/{env_name}", f"/run/secrets/llm/{env_name.lower().replace('_','-')}", f"/run/secrets/llm/{env_name.lower()}"):
+        try:
+            import pathlib
+            fp = pathlib.Path(p)
+            if fp.is_file():
+                v = fp.read_text().strip()
+                if v:
+                    return v
+        except Exception:
+            pass
     v = os.getenv(env_name)
     if v and v.strip():
         return v.strip()
@@ -768,9 +789,13 @@ def _apply_selection_filter(entries: list[dict]) -> list[dict]:
 
 
 # LiteLLM 1.83's RetryPolicy lacks NotFoundErrorRetries; a Router pick on these arms terminates the cascade.
+# Aug 2026: Groq compound/* is an agentic tool-aggregator not in litellm 1.83.13 pricing
+# + not suited for plain chat — skip via blocklist (SOTA: static blocklist + runtime auto-blocklist).
 _ACCOUNT_INACCESSIBLE_BLOCKLIST: frozenset[str] = frozenset({
     "nvidia/llama-3.1-nemotron-ultra-253b-v1",
     "nvidia/nemotron-4-340b-instruct",
+    "groq/compound",
+    "groq/compound-mini",
 })
 
 
@@ -812,6 +837,23 @@ def _apply_inaccessibility_filter(entries: list[dict]) -> list[dict]:
             f"arm(s) (account-404 risk; static={len(_ACCOUNT_INACCESSIBLE_BLOCKLIST)}, "
             f"runtime={len(_RUNTIME_INACCESSIBLE_MODELS)})"
         )
+    return out
+
+
+def _apply_status_filter(entries: list[dict]) -> list[dict]:
+    """Auto-disable providers with invalid/missing keys (via status engine probe)."""
+    try:
+        from domains.llm.rotator.status import is_enabled as _is_enabled
+    except Exception:
+        return entries
+    out = [e for e in entries if _is_enabled(entry_provider_and_model(e)[0])]
+    if not out:
+        # keep original if filter would empty pool (at least allow one attempt to surface error)
+        logger.warning("[llm-chain] status filter would empty pool — ignoring (all providers disabled)")
+        return entries
+    n_dropped = len(entries) - len(out)
+    if n_dropped:
+        logger.info(f"[llm-chain] status filter dropped {n_dropped} arm(s) (invalid/missing key)")
     return out
 
 
@@ -2239,44 +2281,44 @@ def _record_to_entry(group: str, record, timeout_s: int) -> dict | None:
 # Single source of truth — Router model_list AND FGTS-VA bandit candidate
 # pools (the bandit bypasses Router via litellm.acompletion).
 def _all_entries_current() -> list:
-    """dd-all — dynamic if available else static; trimmed by selection + inaccessibility."""
+    """dd-all — dynamic if available else static; trimmed by selection + inaccessibility + status."""
     if _dynamic_catalog_initialized and _dynamic_entries.get("dd-all"):
-        return _apply_inaccessibility_filter(
+        return _apply_status_filter(_apply_inaccessibility_filter(
             _apply_selection_filter(_dynamic_entries["dd-all"])
-        )
-    return _apply_inaccessibility_filter(
+        ))
+    return _apply_status_filter(_apply_inaccessibility_filter(
         _apply_selection_filter(_all_entries())
-    )
+    ))
 
 
 def _synth_entries_current() -> list:
-    """dd-synth — dynamic if available else static; trimmed by selection + inaccessibility."""
+    """dd-synth — dynamic if available else static; trimmed by selection + inaccessibility + status."""
     if _dynamic_catalog_initialized and _dynamic_entries.get("dd-synth"):
-        return _apply_inaccessibility_filter(
+        return _apply_status_filter(_apply_inaccessibility_filter(
             _apply_selection_filter(_dynamic_entries["dd-synth"])
-        )
-    return _apply_inaccessibility_filter(
+        ))
+    return _apply_status_filter(_apply_inaccessibility_filter(
         _apply_selection_filter(_synth_entries())
-    )
+    ))
 
 
 def _reduce_label_entries_current() -> list:
     """dd-reduce-label — dynamic if available else static; trimmed."""
     if _dynamic_catalog_initialized and _dynamic_entries.get("dd-reduce-label"):
-        return _apply_inaccessibility_filter(
+        return _apply_status_filter(_apply_inaccessibility_filter(
             _apply_selection_filter(_dynamic_entries["dd-reduce-label"])
-        )
-    return _apply_inaccessibility_filter(
+        ))
+    return _apply_status_filter(_apply_inaccessibility_filter(
         _apply_selection_filter(_reduce_label_entries())
-    )
+    ))
 
 
 def _rr_strong_entries_current() -> list:
     """rr-strong — static only (curated pool deliberately not discovered live)
-    + selection/inaccessibility filters."""
-    return _apply_inaccessibility_filter(
+    + selection/inaccessibility/status filters."""
+    return _apply_status_filter(_apply_inaccessibility_filter(
         _apply_selection_filter(_rr_strong_entries())
-    )
+    ))
 
 
 def _build_redis_url_for_bench() -> str | None:

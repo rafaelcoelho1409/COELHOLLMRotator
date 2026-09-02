@@ -11,7 +11,17 @@ import httpx
 import os
 
 def resolve_key(env_name: str) -> str:
-    """Mirror chain/service.py — env primary, lower-dash fallback for upload_env_to_k3d.py."""
+    """Secret volume (/run/secrets/llm) + env fallbacks — mirrors chain/service.py."""
+    for p in (f"/run/secrets/llm/{env_name}", f"/run/secrets/llm/{env_name.lower().replace('_','-')}", f"/run/secrets/llm/{env_name.lower()}"):
+        try:
+            import pathlib
+            fp = pathlib.Path(p)
+            if fp.is_file():
+                v = fp.read_text().strip()
+                if v:
+                    return v
+        except Exception:
+            pass
     v = os.getenv(env_name)
     if v and v.strip():
         return v.strip()

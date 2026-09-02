@@ -114,6 +114,15 @@ template:
               name: coelho-llm-rotator-{{ .appName }}-configmap
         env:
           {{- include "coelho-llm-rotator.secretEnvVars" .root | nindent 10 }}
+        volumeMounts:
+          - name: llm-secret-volume
+            mountPath: /run/secrets/llm
+            readOnly: true
+    volumes:
+      - name: llm-secret-volume
+        secret:
+          secretName: {{ .root.Values.secretName }}
+          optional: true
 {{- end -}}
 
 

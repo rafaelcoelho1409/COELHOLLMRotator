@@ -8,58 +8,12 @@ FUZZY_THRESHOLD = 95
 
 
 STEP_WEIGHTS: dict[str, dict[str, float]] = {
-    "dd-synth": {
-        "lmarena_coding": 0.30,
-        "lmarena":        0.25,
-        "aaii":           0.20,
-        "gpqa":           0.15,
-        "mmlu_pro":       0.10,
-    },
-    "dd-reduce-label": {
-        "lmarena":  0.35,
-        "aaii":     0.30,
-        "mmlu_pro": 0.20,
-        "gpqa":     0.15,
-    },
-    "dd-keylm": {
-        "mmlu_pro": 0.45,
-        "aaii":     0.35,
-        "gsm8k":    0.20,
-    },
-    # No free MTEB-equivalent source — fall back to general quality.
-    "dd-embed": {"lmarena": 1.0},
-    "dd-all": {
+    "general": {
         "aaii":           0.30,
         "lmarena":        0.25,
         "lmarena_coding": 0.20,
         "mmlu_pro":       0.15,
         "gpqa":           0.10,
-    },
-    "dd-plan": {
-        "lmarena":  0.30,
-        "aaii":     0.30,
-        "mmlu_pro": 0.20,
-        "arc_agi":  0.20,
-    },
-    "dd-curator": {
-        "lmarena":        0.35,
-        "lmarena_coding": 0.25,
-        "aaii":           0.20,
-        "mmlu_pro":       0.20,
-    },
-    "dd-grader": {
-        "aaii":     0.30,
-        "lmarena":  0.25,
-        "mmlu_pro": 0.20,
-        "gpqa":     0.15,
-        "hle":      0.10,
-    },
-    "dd-critic": {
-        "aaii":     0.30,
-        "lmarena":  0.25,
-        "mmlu_pro": 0.20,
-        "gpqa":     0.15,
-        "hle":      0.10,
     },
 }
 

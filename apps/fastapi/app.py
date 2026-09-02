@@ -1,12 +1,13 @@
 """COELHO LLM Rotator — minimal FastAPI shell.
 
+Providers engine: key validation → auto-disable + Secret detector + live models fan-out.
 """
 import logging
 from contextlib import asynccontextmanager
 
 logging.basicConfig(
-    level = logging.INFO, 
-    format = "%(asctime)s %(levelname)s %(name)s %(message)s")
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s")
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,28 +18,35 @@ from domains.llm.rotator.chain import (
     start_catalog_refresh_loop,
     stop_catalog_refresh_loop,
 )
+from domains.llm.rotator.status import start_status_loop, stop_status_loop
 
 logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Warm dynamic catalog (discovery fan-out) — falls back to static catalog on failure.
     try:
         await init_dynamic_catalog()
     except Exception as e:
         logger.warning(f"[lifespan] dynamic catalog init failed: {type(e).__name__}: {e}. Using static catalog.")
-    # Periodic re-discovery drops EOL'd models without a redeploy.
     try:
         start_catalog_refresh_loop()
     except Exception as e:
         logger.warning(f"[lifespan] catalog refresh loop start failed: {type(e).__name__}: {e}.")
-    
+    try:
+        start_status_loop()
+    except Exception as e:
+        logger.warning(f"[lifespan] status loop start failed: {type(e).__name__}: {e}.")
+
     yield
     try:
         await stop_catalog_refresh_loop()
     except Exception as e:
         logger.warning(f"[lifespan] catalog refresh loop stop failed: {e}")
+    try:
+        stop_status_loop()
+    except Exception as e:
+        logger.warning(f"[lifespan] status loop stop failed: {e}")
 
 
 app = FastAPI(
@@ -70,6 +78,8 @@ async def root():
             "openai_models": "/api/v1/llm/openai/v1/models",
             "openai_chat": "/api/v1/llm/openai/v1/chat/completions",
             "llm_health": "/api/v1/llm/health",
+            "providers": "/api/v1/llm/providers",
+            "providers_models_live": "/api/v1/llm/providers/models/live",
         },
     }
 
