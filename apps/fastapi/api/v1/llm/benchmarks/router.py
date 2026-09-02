@@ -99,8 +99,8 @@ async def leaderboard(
     # 2) union canonicals across all boards
     union: set[str] = set()
     for b in valid_boards: union.update(b.keys())
-    # 3) compute composite per canonical (merge_leaderboards does per-source score merge)
-    from domains.llm.rotator.benchmarks.domain import compute_composite_score, merge_leaderboards
+    # 3) compute composite per canonical + TrueSkill μ−3σ conservative (missing≠0)
+    from domains.llm.rotator.benchmarks.domain import compute_composite_score, merge_leaderboards, true_skill_adjust
     ranked = []
     for canon in union:
         scores = merge_leaderboards(canon, valid_boards)
@@ -109,10 +109,11 @@ async def leaderboard(
         if not scores:
             continue
         composite = compute_composite_score(scores, weights)
-        ranked.append({"canonical": canon, "composite": composite, "scores": scores, "n_sources": len(scores)})
-    ranked.sort(key=lambda x: (-x["composite"], x["canonical"]))
-    # ETag before limit so limit param changes ETag
-    etag = hashlib.sha256(json.dumps([(r["canonical"], r["composite"]) for r in ranked[:limit]], sort_keys=True).encode()).hexdigest()[:16]
+        adjusted = true_skill_adjust(composite, len(scores), n_expected=len(valid_boards))
+        ranked.append({"canonical": canon, "composite": composite, "adjusted": adjusted, "scores": scores, "n_sources": len(scores)})
+    ranked.sort(key=lambda x: (-x["adjusted"], -x["composite"], x["canonical"]))
+    # ETag before limit
+    etag = hashlib.sha256(json.dumps([(r["canonical"], r["adjusted"]) for r in ranked[:limit]], sort_keys=True).encode()).hexdigest()[:16]
     if request.headers.get("if-none-match") == etag:
         if rds:
             try: await rds.aclose()
@@ -153,10 +154,10 @@ async def leaderboard(
         except Exception: pass
     if format == "csv":
         buf = io.StringIO()
-        w = csv.DictWriter(buf, fieldnames=["rank", "canonical", "composite", "n_sources", "providers", "scores_json"])
+        w = csv.DictWriter(buf, fieldnames=["rank", "canonical", "composite", "adjusted", "n_sources", "providers", "scores_json"])
         w.writeheader()
         for i, r in enumerate(ranked, 1):
-            w.writerow({"rank": i, "canonical": r["canonical"], "composite": f"{r['composite']:.4f}", "n_sources": r["n_sources"], "providers": ",".join(r["providers"]), "scores_json": json.dumps(r["scores"], ensure_ascii=False)})
+            w.writerow({"rank": i, "canonical": r["canonical"], "composite": f"{r['composite']:.4f}", "adjusted": f"{r['adjusted']:.4f}", "n_sources": r["n_sources"], "providers": ",".join(r["providers"]), "scores_json": json.dumps(r["scores"], ensure_ascii=False)})
         return PlainTextResponse(buf.getvalue(), headers={"ETag": etag, "Cache-Control": f"public, max-age={CACHE_TTL.leaderboard // 2}", "Content-Type": "text/csv; charset=utf-8"})
     return JSONResponse(
         content={"weights": weights, "count": len(ranked), "leaderboard": ranked, "sources": list(_SOURCES.keys())},

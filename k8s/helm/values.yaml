@@ -23,6 +23,8 @@ secretMappings:
     key: deepseek-api-key
   - envName: SAMBANOVA_API_KEY
     key: sambanova-api-key
+  - envName: HF_TOKEN
+    key: hf-token
 
 registry:
   url: localhost:5001

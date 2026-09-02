@@ -20,21 +20,69 @@ from .patterns import (
 )
 
 
+import re as _re
+
+# SOTA Aug 2026 ModelGraveyard canonical slug — provider_alias + routing + vendor + trailing version
+_PROVIDER_ALIASES: dict[str, str] = {
+    "bedrock": "", "vertex_ai": "google", "vertex_ai_beta": "google",
+    "gemini": "google", "google_genai": "google", "azure": "openai",
+    "groq": "meta-llama", "fireworks_ai": "", "together_ai": "", "deepinfra": "", "ollama": "",
+    "perplexity": "perplexity", "anthropic.claude": "anthropic",
+}
+_ROUTING_PREFIXES: tuple[str, ...] = (
+    "bedrock/", "vertex_ai/", "vertex_ai_beta/", "azure/", "gemini/", "google_genai/",
+    "groq/", "fireworks_ai/", "together_ai/", "deepinfra/", "ollama/", "perplexity/",
+)
+_VENDOR_NAMESPACES: tuple[str, ...] = (
+    "anthropic.", "amazon.", "meta.", "mistral.", "cohere.", "ai21.", "stability.", "deepseek.", "writer.",
+)
+_TRAILING_PATTERNS: tuple[_re.Pattern, ...] = (
+    _re.compile(r"[-@]20\d{6}$"), _re.compile(r"[-@]20\d{2}[-_]?\d{2}[-_]?\d{2}$"),
+    _re.compile(r"[-@]v\d+(\.\d+)?(:\d+)?$"), _re.compile(r"[:][0-9]+$"),
+    _re.compile(r"[-_](latest|preview|stable|exp|experimental)$"),
+)
+# LLM DB 2026.8 alias → dated canonical (subset, extends via priv/llm_db/snapshot.json when present)
+_ALIAS_TO_CANONICAL: dict[str, str] = {
+    "claude-haiku-4-5": "claude-haiku-4-5-20251001", "claude-haiku-4.5": "claude-haiku-4-5-20251001",
+    "claude-opus-4-1": "claude-opus-4-1-20250805", "kimi-k2.6": "kimi-k2.6", "kimi-k3": "kimi-k3",
+    "openai/gpt-oss-120b": "gpt-oss-120b", "moonshotai/kimi-k2.6": "kimi-k2.6",
+}
+
+
 def normalize_model_name(name: str) -> str:
-    """L1 normalizer; preserves size identifiers (-flash, -lite, -nano, -mini)."""
+    """L1→L4 SOTA: provider_alias + routing/vendor strip + trailing version loop + alias DB + size-safe."""
     s = (name or "").strip().lower()
+    # provider alias prefix (ModelGraveyard)
+    for k, v in _PROVIDER_ALIASES.items():
+        if s.startswith(k + "/"):
+            s = s[len(k)+1:]
+            if v: s = f"{v}/{s}" if "/" not in s else s
+            break
+        if s.startswith(k + ":"):
+            s = s[len(k)+1:]
+            if v: s = f"{v}/{s}" if "/" not in s else s
+            break
+    for p in _ROUTING_PREFIXES:
+        if s.startswith(p):
+            s = s[len(p):]; break
+    for ns in _VENDOR_NAMESPACES:
+        if s.startswith(ns):
+            s = s[len(ns):]; break
     s = PROVIDER_PREFIX_RE.sub("", s)
     s = WHITESPACE_RE.sub("-", s)
+    # trailing version/date loop
     for _ in range(4):
         before = s
+        for pat in _TRAILING_PATTERNS:
+            ns = pat.sub("", s)
+            if ns != s: s = ns; break
         for suffix in _PROVIDER_SUFFIXES:
             if s.endswith(suffix):
-                s = s[: -len(suffix)]
-                break
-        if s == before:
-            break
-    s = DASH_RUN_RE.sub("-", s)
-    return s.strip("-")
+                s = s[: -len(suffix)]; break
+        if s == before: break
+    s = DASH_RUN_RE.sub("-", s).strip("-")
+    # alias DB resolve (LLM DB dated canonical)
+    return _ALIAS_TO_CANONICAL.get(s, s)
 
 
 def coerce_score(raw: str) -> float | None:
@@ -184,6 +232,18 @@ def compute_composite_score(
     if weight_total == 0.0:
         return 0.0
     return weighted_sum / weight_total
+
+
+def true_skill_adjust(composite: float, n_sources: int, n_expected: int = 3) -> float:
+    """SOTA Aug 2026 LLM Stats Score μ−3σ approx: missing≠0, sparse → wider σ → conservative discount.
+    composite is μ, n_sources is evidence count, n_expected is benchmarks needed for full confidence.
+    """
+    if n_sources <= 0:
+        return 0.0
+    # σ proxy: 1/sqrt(n) scaled to TrueSkill prior σ₀=25/3; conservative discount 3σ ≈ 0.3*μ*(1 - sqrt(n/n_expected))
+    coverage = min(1.0, n_sources / max(1, n_expected))
+    # power 0.3 matches BenchAlign v5.2 Supported vs Estimated gap
+    return composite * (coverage ** 0.3)
 
 
 def compute_warm_start_score(

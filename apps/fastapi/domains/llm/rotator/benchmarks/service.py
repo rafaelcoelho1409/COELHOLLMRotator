@@ -130,17 +130,52 @@ _BENCH_HEADERS = {"Accept": "application/json", "User-Agent": "coelho-llm-rotato
 
 
 async def _fetch_openlm_arena(client: httpx.AsyncClient) -> dict[str, dict[str, float]]:
-    resp = await client.get(
-        "https://openlm.ai/chatbot-arena/",
-        headers = {
-            "User-Agent": "coelho-llm-rotator/1.0 (free-tier-rotator)",
-            "Accept": "text/html,application/xhtml+xml",
-        },
-        timeout = HTTP_TIMEOUT_S,
-        follow_redirects = True,
-    )
-    resp.raise_for_status()
-    return parse_openlm_table(resp.text)
+    # SOTA Aug 2026: openlm.ai 301→lmarena.ai (Arena) Next.js; old HTML table gone.
+    # Try JSON APIs first (HuggingFace Space + arena.ai), fallback to legacy HTML scrape.
+    for url, headers, is_json in [
+        ("https://huggingface.co/api/datasets/lmarena-ai/arena-leaderboard/leaderboard", _BENCH_HEADERS | {"Accept": "application/json"}, True),
+        ("https://arena.ai/api/leaderboard", _BENCH_HEADERS | {"Accept": "application/json"}, True),
+        ("https://lmarena.ai/api/leaderboard", _BENCH_HEADERS | {"Accept": "application/json"}, True),
+        ("https://openlm.ai/chatbot-arena/", {"User-Agent": "coelho-llm-rotator/1.0 (free-tier-rotator)", "Accept": "text/html,application/xhtml+xml"}, False),
+    ]:
+        try:
+            resp = await client.get(url, headers=headers, timeout=HTTP_TIMEOUT_S, follow_redirects=True)
+            resp.raise_for_status()
+            if is_json:
+                try:
+                    data = resp.json()
+                    # HF Space returns {"leaderboard": [{"model":..., "elo":...}]} or plain dict
+                    if isinstance(data, dict) and "leaderboard" in data:
+                        data = data["leaderboard"]
+                    if isinstance(data, list):
+                        # list of {model, arena_score} → convert to openlm table shape
+                        tmp = {}
+                        for row in data:
+                            name = row.get("model") or row.get("id") or row.get("name") or ""
+                            elo = row.get("elo") or row.get("arena_score") or row.get("score")
+                            if name and elo:
+                                try: tmp[name] = {"lmarena": float(elo)}
+                                except: pass
+                        if tmp:
+                            # normalize via same path as HTML parser expects
+                            from .domain import normalize_model_name
+                            return {normalize_model_name(k): v for k, v in tmp.items()}
+                    if isinstance(data, dict):
+                        # assume already {model: {lmarena:..}}
+                        from .domain import normalize_model_name
+                        return {normalize_model_name(k): v for k, v in data.items() if isinstance(v, dict)}
+                except Exception as e:
+                    logger.debug(f"[bench] openlm JSON {url} parse failed: {e}")
+                    continue
+            else:
+                parsed = parse_openlm_table(resp.text)
+                if parsed:
+                    return parsed
+        except Exception as e:
+            logger.debug(f"[bench] openlm {url} failed: {type(e).__name__}: {str(e)[:120]}")
+            continue
+    logger.warning("[bench] openlm_arena all endpoints failed → 0")
+    return {}
 
 
 async def _fetch_oolong_code(client: httpx.AsyncClient) -> dict[str, dict[str, float]]:
@@ -169,14 +204,77 @@ async def _fetch_oolong_code(client: httpx.AsyncClient) -> dict[str, dict[str, f
 
 
 async def _fetch_openevals(client: httpx.AsyncClient) -> dict[str, dict[str, float]]:
-    resp = await client.get(
+    # SOTA Aug 2026: HF Hub docs — OpenEvals/leaderboard-data aggregates into one Parquet
+    # hf://datasets/OpenEvals/leaderboard-data/data/train-00000-of-00001.parquet
+    # JSON API at /api/datasets/.../leaderboard returns [] (empty) — use Parquet.
+    import os, tempfile
+    hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN") or ""
+    # 1) Parquet via HF resolve (fastest cross-benchmark view)
+    for url in [
+        "https://huggingface.co/datasets/OpenEvals/leaderboard-data/resolve/main/data/train-00000-of-00001.parquet",
+        "https://huggingface.co/datasets/OpenEvals/leaderboard-data/resolve/main/data/train.parquet",
+    ]:
+        try:
+            headers = dict(_BENCH_HEADERS)
+            if hf_token:
+                headers["Authorization"] = f"Bearer {hf_token}"
+            resp = await client.get(url, headers=headers, timeout=HTTP_TIMEOUT_S, follow_redirects=True)
+            if resp.status_code == 429:
+                import asyncio as _aio; await _aio.sleep(2); continue
+            resp.raise_for_status()
+            # write to temp and read via pandas/pyarrow
+            with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as tmp:
+                tmp.write(resp.content); tmp_path = tmp.name
+            try:
+                import pandas as pd
+                df = pd.read_parquet(tmp_path)
+                out: dict[str, dict[str, float]] = {}
+                for _, row in df.iterrows():
+                    name = str(row.get("model_name") or row.get("model_id") or row.get("model") or "").strip()
+                    if not name: continue
+                    scores: dict[str, float] = {}
+                    for col in ["aime2026_score", "mmluPro_score", "gpqa_score", "hle_score", "gsm8k_score", "math_score"]:
+                        v = row.get(col)
+                        if v is not None and str(v) not in ("", "nan"):
+                            try: scores[col.replace("_score","").replace("mmluPro","mmlu_pro")] = float(v)
+                            except: pass
+                    # also map generic
+                    for k in ["mmlu_pro", "gpqa", "hle", "gsm8k", "math", "aime"]:
+                        if k not in scores and row.get(k) is not None:
+                            try: scores[k] = float(row.get(k))
+                            except: pass
+                    if scores:
+                        from .domain import normalize_model_name
+                        out[normalize_model_name(name)] = scores
+                if out:
+                    logger.info(f"[bench] openevals Parquet {url} → {len(out)} models")
+                    return out
+            finally:
+                try: import os as _os; _os.unlink(tmp_path)
+                except: pass
+        except Exception as e:
+            logger.debug(f"[bench] openevals Parquet {url} failed: {type(e).__name__}: {str(e)[:180]}")
+            continue
+    # 2) fallback legacy JSON endpoints
+    for url in [
         "https://huggingface.co/datasets/OpenEvals/leaderboard-data/resolve/main/leaderboard.json",
-        headers = _BENCH_HEADERS,
-        timeout = HTTP_TIMEOUT_S,
-        follow_redirects = True,
-    )
-    resp.raise_for_status()
-    return parse_openevals_payload(resp.json())
+        "https://huggingface.co/spaces/OpenEvals/every-leaderboards/resolve/main/leaderboard.json",
+    ]:
+        for attempt in range(3):
+            try:
+                headers = dict(_BENCH_HEADERS)
+                if hf_token:
+                    headers["Authorization"] = f"Bearer {hf_token}"
+                resp = await client.get(url, headers=headers, timeout=HTTP_TIMEOUT_S, follow_redirects=True)
+                if resp.status_code == 429:
+                    import asyncio as _aio; await _aio.sleep(int(resp.headers.get("retry-after","2"))); continue
+                resp.raise_for_status()
+                return parse_openevals_payload(resp.json())
+            except Exception as e:
+                logger.debug(f"[bench] openevals JSON {url} {type(e).__name__}: {str(e)[:120]}")
+                break
+    logger.warning("[bench] openevals all endpoints failed → 0")
+    return {}
 
 
 _SOURCES: dict[str, Callable[[httpx.AsyncClient], Awaitable[dict[str, dict[str, float]]]]] = {
@@ -255,6 +353,25 @@ async def rank_for_step(
         )
     )
     return ranked
+
+
+def get_composite_cached(canonical: str, weights: dict[str, float] | None = None) -> float:
+    """Sync composite from in-mem leaderboards (no network) — for Router cold-start sort."""
+    if not canonical:
+        return 0.0
+    boards = [v[1] for v in _inmem_leaderboards.values() if isinstance(v, tuple) and len(v)==2 and isinstance(v[1], dict) and v[1]]
+    if not boards:
+        return 0.0
+    from .domain import merge_leaderboards, compute_composite_score, true_skill_adjust, normalize_model_name
+    from .params import STEP_WEIGHTS
+    w = weights or STEP_WEIGHTS["general"]
+    canon_norm = normalize_model_name(canonical)
+    scores = merge_leaderboards(canon_norm, boards)
+    if not scores:
+        return 0.0
+    comp = compute_composite_score(scores, w)
+    # apply same TrueSkill conservative as leaderboard
+    return true_skill_adjust(comp, len(scores), n_expected=3)
 
 
 def _ensure_metrics() -> dict[str, Any]:

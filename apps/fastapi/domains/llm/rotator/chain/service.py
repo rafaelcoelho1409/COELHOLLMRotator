@@ -857,6 +857,34 @@ def _apply_status_filter(entries: list[dict]) -> list[dict]:
     return out
 
 
+def _sort_by_benchmark(entries: list[dict]) -> list[dict]:
+    """SOTA: sort Router pool best→worst by benchmark general composite (TrueSkill μ−3σ).
+    Uses in-mem cached boards via get_composite_cached (no network), fallback to original order."""
+    try:
+        from domains.llm.rotator.benchmarks.service import get_composite_cached
+        from domains.llm.rotator.benchmarks.domain import normalize_model_name
+        from .params import _PROVIDER_CHAPTER_CAPS  # keep tie-break deterministic
+        # provider tier from benchmarks params
+        from domains.llm.rotator.benchmarks.params import PROVIDER_TIER
+    except Exception:
+        return entries
+    def _score(e: dict):
+        try:
+            model = e.get("litellm_params", {}).get("model", "") or ""
+            bare = model.split("/", 1)[-1] if "/" in model else model
+            if model.startswith("nvidia_nim/"):
+                bare = model.split("nvidia_nim/", 1)[-1]
+            c = get_composite_cached(bare)
+            tier = PROVIDER_TIER.get(entry_provider_and_model(e)[0], 99)
+            return (-c, tier, bare)
+        except Exception:
+            return (0, 99, "")
+    try:
+        return sorted(entries, key=_score)
+    except Exception:
+        return entries
+
+
 # Subclassing (not wrapping) because DeepAgents' resolve_model does isinstance(BaseChatModel); a wrapper would fail.
 import re as _re
 _MODEL_RE = _re.compile(r"litellm\.acompletion\(model=([^)\s]+)\)")
@@ -2281,44 +2309,43 @@ def _record_to_entry(group: str, record, timeout_s: int) -> dict | None:
 # Single source of truth — Router model_list AND FGTS-VA bandit candidate
 # pools (the bandit bypasses Router via litellm.acompletion).
 def _all_entries_current() -> list:
-    """dd-all — dynamic if available else static; trimmed by selection + inaccessibility + status."""
+    """dd-all — dynamic if available else static; trimmed by selection + inaccessibility + status + benchmark sort."""
     if _dynamic_catalog_initialized and _dynamic_entries.get("dd-all"):
-        return _apply_status_filter(_apply_inaccessibility_filter(
+        return _sort_by_benchmark(_apply_status_filter(_apply_inaccessibility_filter(
             _apply_selection_filter(_dynamic_entries["dd-all"])
-        ))
-    return _apply_status_filter(_apply_inaccessibility_filter(
+        )))
+    return _sort_by_benchmark(_apply_status_filter(_apply_inaccessibility_filter(
         _apply_selection_filter(_all_entries())
-    ))
+    )))
 
 
 def _synth_entries_current() -> list:
-    """dd-synth — dynamic if available else static; trimmed by selection + inaccessibility + status."""
+    """dd-synth — dynamic if available else static; trimmed by selection + inaccessibility + status + benchmark."""
     if _dynamic_catalog_initialized and _dynamic_entries.get("dd-synth"):
-        return _apply_status_filter(_apply_inaccessibility_filter(
+        return _sort_by_benchmark(_apply_status_filter(_apply_inaccessibility_filter(
             _apply_selection_filter(_dynamic_entries["dd-synth"])
-        ))
-    return _apply_status_filter(_apply_inaccessibility_filter(
+        )))
+    return _sort_by_benchmark(_apply_status_filter(_apply_inaccessibility_filter(
         _apply_selection_filter(_synth_entries())
-    ))
+    )))
 
 
 def _reduce_label_entries_current() -> list:
-    """dd-reduce-label — dynamic if available else static; trimmed."""
+    """dd-reduce-label — dynamic if available else static; trimmed + benchmark."""
     if _dynamic_catalog_initialized and _dynamic_entries.get("dd-reduce-label"):
-        return _apply_status_filter(_apply_inaccessibility_filter(
+        return _sort_by_benchmark(_apply_status_filter(_apply_inaccessibility_filter(
             _apply_selection_filter(_dynamic_entries["dd-reduce-label"])
-        ))
-    return _apply_status_filter(_apply_inaccessibility_filter(
+        )))
+    return _sort_by_benchmark(_apply_status_filter(_apply_inaccessibility_filter(
         _apply_selection_filter(_reduce_label_entries())
-    ))
+    )))
 
 
 def _rr_strong_entries_current() -> list:
-    """rr-strong — static only (curated pool deliberately not discovered live)
-    + selection/inaccessibility/status filters."""
-    return _apply_status_filter(_apply_inaccessibility_filter(
+    """rr-strong — static only + selection/inaccessibility/status + benchmark sort."""
+    return _sort_by_benchmark(_apply_status_filter(_apply_inaccessibility_filter(
         _apply_selection_filter(_rr_strong_entries())
-    ))
+    )))
 
 
 def _build_redis_url_for_bench() -> str | None:
