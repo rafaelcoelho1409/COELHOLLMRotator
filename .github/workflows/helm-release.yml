@@ -57,6 +57,16 @@ jobs:
           echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io \
             --username "${{ github.actor }}" --password-stdin
 
+      - name: Fetch chart dependencies
+        # charts/*.tgz is gitignored (regenerated, not committed) — pull it back
+        # down so `helm package` has valkey to embed. `dependency build` needs
+        # the repo pre-registered via `helm repo add` (which this runner never
+        # does); `dependency update` resolves the `repository:` URL in
+        # Chart.yaml directly, no pre-registration needed. Safe here since the
+        # dependency is pinned to an exact version, not a range.
+        if: steps.version.outputs.changed == 'true'
+        run: helm dependency update "${CHART_DIR}"
+
       - name: Package chart
         if: steps.version.outputs.changed == 'true'
         run: helm package "${CHART_DIR}" --destination /tmp/chart-out
