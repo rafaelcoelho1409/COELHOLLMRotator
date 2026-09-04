@@ -15,6 +15,14 @@ Credentials are loaded from secret via secretRef
 {{- define "coelho-llm-rotator.commonEnvVars" -}}
 ENVIRONMENT: "{{ .Values.environment }}"
 FASTAPI_HOST: "coelho-llm-rotator-fastapi"
+{{- if .Values.redis }}
+{{- if .Values.redis.host }}
+REDIS_HOST: "{{ .Values.redis.host }}"
+{{- end }}
+{{- if .Values.redis.port }}
+REDIS_PORT: "{{ .Values.redis.port }}"
+{{- end }}
+{{- end }}
 {{- end -}}
 
 {{/*

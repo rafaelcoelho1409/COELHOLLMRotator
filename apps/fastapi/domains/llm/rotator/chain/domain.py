@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import re
+import time
+
 from .keys import (
     WRITE_HEAVYWEIGHTS,
     _LITELLM_PREFIX_TO_PROVIDER,
@@ -40,6 +43,53 @@ def is_eol_error(exc: Exception) -> bool:
     if "404" in msg and ("model" in msg or "function" in msg):
         return True
     return any(p in msg for p in _EOL_PHRASES)
+
+
+def is_insufficient_credits_error(exc: Exception) -> bool:
+    """True for 402 Insufficient credits / Payment required / model_terms_required."""
+    msg = str(exc).lower()
+    name = type(exc).__name__.lower()
+    if "402" in msg or "insufficient credits" in msg or "payment required" in msg:
+        return True
+    if "model_terms_required" in msg or "requires terms acceptance" in msg:
+        return True
+    if "invalid_request" in name and "terms" in msg:
+        return True
+    return False
+
+
+_FREE_DAILY_QUOTA_PHRASES = ("free-models-per-day", "free_models_per_day")
+_RATE_LIMIT_RESET_RE = re.compile(r'x-ratelimit-reset["\s:]+"?(\d{10,13})"?', re.IGNORECASE)
+_MIN_QUOTA_COOLDOWN_S = 30.0
+_DEFAULT_QUOTA_COOLDOWN_S = 900.0     # free-tier daily limit, reset header missing
+_DEFAULT_CREDITS_COOLDOWN_S = 1800.0  # true 402 insufficient credits — needs a top-up, not a reset
+
+
+def _rate_limit_reset_in_s(msg: str) -> float | None:
+    """Seconds until OpenRouter's X-RateLimit-Reset (epoch ms or s) elapses, if present in the error text."""
+    m = _RATE_LIMIT_RESET_RE.search(msg)
+    if not m:
+        return None
+    val = int(m.group(1))
+    if val > 10**12:  # epoch milliseconds
+        val /= 1000
+    return max(_MIN_QUOTA_COOLDOWN_S, val - time.time())
+
+
+def classify_provider_outage(exc: Exception) -> tuple[str, float] | None:
+    """Provider-wide (not just this model) outages that need a cooldown, distinct by cause:
+    - 'insufficient_credits' (true 402/payment-required): persists until manual top-up → long cooldown.
+    - 'free_quota_exhausted' (429 daily free-tier limit): resets on its own → cooldown until
+      the provider's X-RateLimit-Reset if present, else a short default.
+    Returns None for errors that are transient/per-model and should NOT disable the whole provider.
+    """
+    if is_insufficient_credits_error(exc):
+        return ("insufficient_credits", _DEFAULT_CREDITS_COOLDOWN_S)
+    msg = str(exc).lower()
+    if "rate limit" in msg and any(p in msg for p in _FREE_DAILY_QUOTA_PHRASES):
+        reset_s = _rate_limit_reset_in_s(msg)
+        return ("free_quota_exhausted", reset_s if reset_s is not None else _DEFAULT_QUOTA_COOLDOWN_S)
+    return None
 
 
 def is_heavyweight(deployment_id: str) -> bool:

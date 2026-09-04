@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -27,6 +28,95 @@ _refresh_task: asyncio.Task | None = None
 _secret_path = Path("/run/secrets/llm")
 _PROBE_INTERVAL_S = 60
 _SECRET_POLL_S = 10
+
+# Cross-process provider cooldown (402/429-quota outages). Backed by the
+# bundled Valkey instance (k8s/helm's `valkey` dependency, wire-compatible
+# with Redis — REDIS_HOST/PORT point at it, see values.yaml) so a disable
+# from one process is visible to every other process immediately, instead
+# of only living in this process's _status_cache.
+_COOLDOWN_KEY_PREFIX = "llmrotator:cooldown:"
+
+
+def _redis_conn():
+    # lazy import — chain.service imports this module too; avoids a cycle at load time.
+    from domains.llm.rotator.chain.service import _redis_sync_conn
+    return _redis_sync_conn()
+
+
+def _read_cooldown(pid: str) -> dict[str, Any] | None:
+    """Active cooldown for pid, or None. Redis/Valkey key TTL is the cooldown itself — presence == active."""
+    r = _redis_conn()
+    if r is None:
+        return None
+    try:
+        raw = r.get(_COOLDOWN_KEY_PREFIX + pid)
+        return json.loads(raw) if raw else None
+    except Exception as e:
+        logger.debug(f"[status] cooldown read failed for {pid}: {e}")
+        return None
+    finally:
+        try:
+            r.close()
+        except Exception:
+            pass
+
+
+def _active_local_cooldown(pid: str) -> dict[str, Any] | None:
+    """Same-process fallback for _read_cooldown — covers the moment before
+    Valkey is reachable (pod just started) and any transient connection
+    blip, so a disable this process just made can never be clobbered by
+    its own next refresh_all() tick even if the Redis/Valkey call fails."""
+    ent = _status_cache.get(pid)
+    if not ent:
+        return None
+    until = ent.get("cooldown_until")
+    if until and until > time.time():
+        return {"reason": ent.get("disabled_reason"), "until": until}
+    return None
+
+
+def disable_provider(provider: str, reason: str, cooldown_s: float) -> None:
+    """Provider-wide disable with a TTL cooldown, visible cluster-wide (Redis/
+    Valkey) and self-healing: the disable expires on its own (key TTL), and
+    the next _status_loop probe (or a fresh request once re-enabled) tests
+    if the provider is back.
+    """
+    until = time.time() + cooldown_s
+    ent = _status_cache.get(provider)
+    if ent is not None:
+        ent["enabled"] = False
+        ent["disabled_reason"] = reason
+        ent["ok"] = False
+        ent["cooldown_until"] = until
+    else:
+        _status_cache[provider] = {
+            "id": provider, "enabled": False, "disabled_reason": reason,
+            "ok": False, "cooldown_until": until,
+        }
+    r = _redis_conn()
+    if r is not None:
+        try:
+            r.setex(
+                _COOLDOWN_KEY_PREFIX + provider,
+                max(1, int(cooldown_s)),
+                json.dumps({"reason": reason, "until": until}),
+            )
+        except Exception as e:
+            logger.warning(f"[status] cooldown redis write failed for {provider}: {e}")
+        finally:
+            try:
+                r.close()
+            except Exception:
+                pass
+    logger.warning(
+        f"[status] {provider} disabled ({reason}) for {cooldown_s:.0f}s "
+        f"(until {time.strftime('%H:%M:%S', time.localtime(until))})"
+    )
+    try:
+        from domains.llm.rotator.chain.service import reset_rotator
+        reset_rotator(bump_gen=True)  # cross-process rebuild signal, not just this worker
+    except Exception:
+        pass
 
 
 def _secret_hash() -> str:
@@ -96,6 +186,14 @@ async def refresh_all() -> dict[str, dict[str, Any]]:
             "id": pid,
             **res,
         }
+        # Don't let a routine 60s re-probe silently clear an active outage cooldown —
+        # a generic key-validity probe can't see per-model 402/429-quota exhaustion.
+        # Redis first (cross-process); local _status_cache as fallback when no Redis.
+        cooldown = _read_cooldown(pid) or _active_local_cooldown(pid)
+        if cooldown is not None:
+            entry["enabled"] = False
+            entry["disabled_reason"] = cooldown.get("reason", "cooldown")
+            entry["cooldown_until"] = cooldown.get("until")
         new_cache[pid] = entry
         if _status_cache.get(pid, {}).get("enabled") != entry["enabled"] or _status_cache.get(pid, {}).get("ok") != entry["ok"]:
             changed = True
@@ -118,7 +216,15 @@ def get_status(pid: str | None = None) -> dict[str, dict[str, Any]] | dict[str, 
 
 
 def is_enabled(pid: str) -> bool:
-    """Chain filter helper — disabled providers are skipped."""
+    """Chain filter helper — disabled providers are skipped.
+
+    Checks the Redis-backed cooldown first so a disable from another process
+    (e.g. a Celery worker hitting a 402) takes effect here immediately, without
+    waiting for this process's next 60s _status_loop tick. Falls back to the
+    local _status_cache cooldown when Redis isn't configured.
+    """
+    if _read_cooldown(pid) is not None or _active_local_cooldown(pid) is not None:
+        return False
     ent = _status_cache.get(pid)
     if ent is None:
         # before first probe, fall back to registry + key_present

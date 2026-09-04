@@ -2,8 +2,18 @@ apiVersion: v2
 name: coelho-llm-rotator
 description: COELHO LLM Rotator
 type: application
-version: 1.0.0
-appVersion: "1.0.0"
+version: 1.1.0
+appVersion: "1.1.0"
 
 
-dependencies: []
+dependencies:
+  # Bundled internal cache for cross-process provider-cooldown state (see
+  # domains/llm/rotator/status/service.py). BSD-3-Clause, Linux Foundation,
+  # wire-compatible with the redis-py client already used here. Deployed as
+  # part of THIS chart (standalone, single instance, no persistence) so the
+  # feature works identically in every environment this chart is installed
+  # into, without depending on a shared/external Redis that may not be
+  # reachable from every cluster context (e.g. the standalone k3d cluster).
+  - name: valkey
+    version: "0.12.0"
+    repository: "https://valkey.io/valkey-helm/"

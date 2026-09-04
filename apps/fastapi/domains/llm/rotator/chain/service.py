@@ -83,6 +83,7 @@ def get_store():  # stub: BYOK/MinIO removed — selection lives in env/secret n
 from .config import DYNAMIC_STEPS, JUDGE
 from .domain import (
     classify_error,
+    classify_provider_outage,
     entry_provider_and_model,
     is_eol_error,
     is_non_chat_model,
@@ -846,6 +847,39 @@ def mark_inaccessible(model_id: str) -> None:
     reset_rotator(bump_gen=False)
 
 
+_PROVIDER_ID_CANDIDATES = (
+    "groq", "cerebras", "openrouter", "mistral", "gemini", "sambanova", "deepseek", "nim",
+)
+
+
+def disable_provider_for_outage(model: str | None, exc: Exception) -> None:
+    """402 insufficient-credits / 429 free-daily-quota → provider-wide cooldown
+    (cross-process via status.disable_provider), not just a per-model blocklist —
+    those errors mean every model on that provider is unusable, not just one.
+    No-op if `exc` isn't an outage-class error (see classify_provider_outage).
+    """
+    outage = classify_provider_outage(exc)
+    if outage is None:
+        return
+    reason, cooldown_s = outage
+    prov = None
+    if model and "/" in model:
+        prov = model.split("/", 1)[0]
+    else:
+        txt = str(exc).lower()
+        for cand in _PROVIDER_ID_CANDIDATES:
+            if cand in txt:
+                prov = cand
+                break
+    if not prov:
+        return
+    try:
+        from domains.llm.rotator.status.service import disable_provider
+        disable_provider(prov, reason, cooldown_s)
+    except Exception as ex:
+        logger.debug(f"[llm-chain] provider disable failed for {prov!r}: {type(ex).__name__}: {ex}")
+
+
 def _apply_inaccessibility_filter(entries: list[dict]) -> list[dict]:
     """No-empty guard: empty result after filter → keep entries unchanged."""
     blocklist = _ACCOUNT_INACCESSIBLE_BLOCKLIST | frozenset(_RUNTIME_INACCESSIBLE_MODELS)
@@ -1144,17 +1178,22 @@ class _RotatorAutoRetryRouter(ChatLiteLLMRouter):
                         messages, stop=stop, run_manager=run_manager, **kwargs,
                     )
                 except Exception as e:
-                    # is_eol_error covers 404/410/deprecated.
-                    if not (isinstance(e, litellm.NotFoundError) or is_eol_error(e)):
+                    # is_eol_error covers 404/410/deprecated; classify_provider_outage covers 402 credits / 429 daily-quota.
+                    outage = classify_provider_outage(e)
+                    if not (isinstance(e, litellm.NotFoundError) or is_eol_error(e) or outage is not None):
                         raise
                     last_err = e
                     model = _extract_model_from_error(str(e), exc=e)
                     if model:
                         mark_inaccessible(model)
-                    else:
+                    if outage is not None:
+                        # Provider-wide (not just this model) — 402/429-quota means every
+                        # model on that provider is currently unusable, so disable the FGTS-VA arm.
+                        disable_provider_for_outage(model, e)
+                    if not model:
                         # NIM hides model behind a UUID; Router's allowed_fails will demote it.
                         logger.warning(
-                            f"[rotator-retry] EOL-class error on attempt "
+                            f"[rotator-retry] EOL/outage-class error on attempt "
                             f"{attempt+1} from unidentified deployment; forcing "
                             f"Router reshuffle"
                         )
@@ -1276,15 +1315,18 @@ class _RotatorAutoRetryRouter(ChatLiteLLMRouter):
                     messages, stop=stop, run_manager=run_manager, **kwargs,
                 )
             except Exception as e:
-                if not (isinstance(e, litellm.NotFoundError) or is_eol_error(e)):
+                outage = classify_provider_outage(e)
+                if not (isinstance(e, litellm.NotFoundError) or is_eol_error(e) or outage is not None):
                     raise
                 last_err = e
                 model = _extract_model_from_error(str(e), exc=e)
                 if model:
                     mark_inaccessible(model)
-                else:
+                if outage is not None:
+                    disable_provider_for_outage(model, e)
+                if not model:
                     logger.warning(
-                        f"[rotator-retry] EOL-class error on attempt "
+                        f"[rotator-retry] EOL/outage-class error on attempt "
                         f"{attempt+1} from unidentified deployment; forcing "
                         f"Router reshuffle"
                     )

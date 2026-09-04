@@ -1,8 +1,24 @@
 environment: production
 
+# Points at the bundled valkey dependency below (same release, same namespace —
+# works in every environment this chart is installed into: standalone k3d,
+# COELHO Cloud prod, and as a Nexus Helm dependency).
 redis:
-  host: redis-master.redis.svc.cluster.local
+  host: coelho-llm-rotator-valkey
   port: 6379
+
+# Standalone (single instance, no replication, no persistence — cooldown state
+# is transient by design, fine to lose on a restart) internal cache. See
+# https://github.com/valkey-io/valkey-helm for the full value schema.
+valkey:
+  fullnameOverride: coelho-llm-rotator-valkey
+  resources:
+    requests:
+      cpu: 25m
+      memory: 32Mi
+    limits:
+      cpu: 100m
+      memory: 128Mi
 
 secretName: coelho-llm-rotator-secret
 
