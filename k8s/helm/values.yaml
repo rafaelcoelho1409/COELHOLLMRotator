@@ -23,8 +23,11 @@ valkey:
 secretName: coelho-llm-rotator-secret
 
 secretMappings:
-  - envName: REDIS_PASSWORD
-    key: redis-password
+  # No REDIS_PASSWORD entry: the bundled valkey above has auth.enabled: false
+  # (internal-only cache, no sensitive data). A leftover `redis-password` key
+  # in this secret from the old external-Redis design would set a real
+  # password env var against a Valkey that expects none, and Valkey rejects
+  # AUTH outright when no password is configured — breaking every connection.
   - envName: GROQ_API_KEY
     key: groq-api-key
   - envName: NVIDIA_API_KEY

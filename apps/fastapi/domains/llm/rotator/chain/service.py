@@ -87,6 +87,7 @@ from .domain import (
     entry_provider_and_model,
     is_eol_error,
     is_non_chat_model,
+    is_transient_overload_error,
     passes_capability_floor,
     provider_key_env,
     provider_mode,
@@ -1178,13 +1179,17 @@ class _RotatorAutoRetryRouter(ChatLiteLLMRouter):
                         messages, stop=stop, run_manager=run_manager, **kwargs,
                     )
                 except Exception as e:
-                    # is_eol_error covers 404/410/deprecated; classify_provider_outage covers 402 credits / 429 daily-quota.
+                    # is_eol_error: 404/410/deprecated (permanent, blocklist). classify_provider_outage:
+                    # 402 credits / 429 daily-quota (provider-wide, cooldown). is_transient_overload_error:
+                    # 503/'temporarily overloaded' on ONE deployment — retry-eligible only, no blocklist
+                    # (it may well succeed again in seconds; permanently dropping it would be overkill).
                     outage = classify_provider_outage(e)
-                    if not (isinstance(e, litellm.NotFoundError) or is_eol_error(e) or outage is not None):
+                    overloaded = is_transient_overload_error(e)
+                    if not (isinstance(e, litellm.NotFoundError) or is_eol_error(e) or outage is not None or overloaded):
                         raise
                     last_err = e
                     model = _extract_model_from_error(str(e), exc=e)
-                    if model:
+                    if model and not overloaded:
                         mark_inaccessible(model)
                     if outage is not None:
                         # Provider-wide (not just this model) — 402/429-quota means every
@@ -1316,11 +1321,12 @@ class _RotatorAutoRetryRouter(ChatLiteLLMRouter):
                 )
             except Exception as e:
                 outage = classify_provider_outage(e)
-                if not (isinstance(e, litellm.NotFoundError) or is_eol_error(e) or outage is not None):
+                overloaded = is_transient_overload_error(e)
+                if not (isinstance(e, litellm.NotFoundError) or is_eol_error(e) or outage is not None or overloaded):
                     raise
                 last_err = e
                 model = _extract_model_from_error(str(e), exc=e)
-                if model:
+                if model and not overloaded:
                     mark_inaccessible(model)
                 if outage is not None:
                     disable_provider_for_outage(model, e)

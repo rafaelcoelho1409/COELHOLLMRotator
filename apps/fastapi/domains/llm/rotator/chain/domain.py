@@ -92,6 +92,22 @@ def classify_provider_outage(exc: Exception) -> tuple[str, float] | None:
     return None
 
 
+def is_transient_overload_error(exc: Exception) -> bool:
+    """True for a provider-side 503/'temporarily overloaded' on ONE deployment.
+    Unlike classify_provider_outage, this is NOT provider-wide (a single
+    overloaded model doesn't mean every model on that provider is down) and
+    NOT permanently blocklisted (unlike is_eol_error) — it's just retry-
+    eligible so the current call falls through to a different deployment in
+    the pool instead of hard-failing on the first hit."""
+    msg = str(exc).lower()
+    name = type(exc).__name__.lower()
+    if "serviceunavailable" in name:
+        return True
+    if "temporarily overloaded" in msg or "service unavailable" in msg:
+        return True
+    return False
+
+
 def is_heavyweight(deployment_id: str) -> bool:
     return any(s in deployment_id for s in WRITE_HEAVYWEIGHTS)
 
