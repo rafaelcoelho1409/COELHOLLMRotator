@@ -1,9 +1,11 @@
 name: Helm chart release (GHCR OCI)
 
 # Packages k8s/helm and pushes it to oci://ghcr.io/rafaelcoelho1409/charts whenever
-# Chart.yaml's `version:` field changes on a push to master. Only fires on an actual
-# version bump — GHCR OCI tags are immutable, so re-pushing an unchanged version fails,
-# and it lets COELHO Nexus's Helm dependency track a real, deliberate release.
+# Chart.yaml's `version:` isn't already published there. Checked against the
+# registry itself (not git history) — GHCR OCI tags are immutable, so this is
+# also what makes the job safe to retry after a failed run: a fix-only commit
+# that doesn't touch Chart.yaml still republishes the still-missing version,
+# which a "did the version field change since the last commit" diff cannot do.
 on:
   push:
     branches: [master]
@@ -25,37 +27,29 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 2
 
       - name: Set up Helm
         uses: azure/setup-helm@v4
         with:
           version: v3.16.4
 
-      - name: Detect chart version bump
-        id: version
-        run: |
-          new_version="$(yq -r '.version' "${CHART_DIR}/Chart.yaml")"
-          if git show 'HEAD~1:${{ env.CHART_DIR }}/Chart.yaml' > /tmp/prev-chart.yaml 2>/dev/null; then
-            old_version="$(yq -r '.version' /tmp/prev-chart.yaml)"
-          else
-            old_version=""
-          fi
-          echo "new=${new_version}" >> "$GITHUB_OUTPUT"
-          if [ "${new_version}" = "${old_version}" ]; then
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "Chart version unchanged (${new_version}) — skipping publish."
-          else
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-            echo "Chart version bumped: ${old_version:-<none>} -> ${new_version}"
-          fi
-
       - name: Log in to GHCR
-        if: steps.version.outputs.changed == 'true'
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io \
             --username "${{ github.actor }}" --password-stdin
+
+      - name: Check if this version is already published
+        id: version
+        run: |
+          new_version="$(yq -r '.version' "${CHART_DIR}/Chart.yaml")"
+          echo "new=${new_version}" >> "$GITHUB_OUTPUT"
+          if helm show chart "${OCI_REGISTRY}/coelho-llm-rotator" --version "${new_version}" >/dev/null 2>&1; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "coelho-llm-rotator ${new_version} is already published — skipping."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "coelho-llm-rotator ${new_version} not found in registry — publishing."
+          fi
 
       - name: Fetch chart dependencies
         # charts/*.tgz is gitignored (regenerated, not committed) — pull it back
